@@ -1,0 +1,6 @@
+retrieve:
+  model_url: "<url-1>"
+  topk: 10
+  bm25_weight: 0.5
+generator:
+  model_url: "<url-1>"

@@ -1,0 +1,28 @@
+rewriter:
+  model_url: "https://api.zhizengzeng.com/v1"
+  model_name: "gpt-4o-mini"
+  api_key: "sk-zk2a9670ffd66cd147a52dca250662f1334694f88bae25e4"
+
+retrieve:
+  model_url: "/home/cz/ragsearch-jane/models/sentence-transformers--all-MiniLM-L6-v2"
+
+reranker:
+  model_url: "/home/cz/ragsearch-jane/models/cross-encoder--ms-marco-MiniLM-L-6-v2"
+
+pruner:
+  model_url: "https://api.zhizengzeng.com/v1"
+  model_name: "gpt-4o-mini"
+  api_key: "sk-zk2a9670ffd66cd147a52dca250662f1334694f88bae25e4"
+
+generator:
+  model_url: "https://api.zhizengzeng.com/v1"
+  model_name: "gpt-4o-mini"
+  api_key: "sk-zk2a9670ffd66cd147a52dca250662f1334694f88bae25e4"
+
+eval_metrics:
+  llmaaj:
+    model_url: "https://api.zhizengzeng.com/v1"
+    model_name: "gpt-4o-mini"
+    api_key: "sk-zk2a9670ffd66cd147a52dca250662f1334694f88bae25e4"
+  bert:
+    model_url: "/home/cz/ragsearch-jane/models/bert-base-uncased"
