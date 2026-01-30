@@ -114,6 +114,8 @@ def check_config(selection_path: str, config_path: str | None = None) -> Dict[st
         "selection.retrieve.model_url",
         "selection.retrieve.topk",
         "selection.retrieve.bm25_weight",
+        "selection.chunking",
+        "selection.chunking.chunk_size",
         "selection.generator",
         "selection.generator.model_url",
     }

@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 import random
@@ -145,7 +144,7 @@ def _score_from_report(
 
 
 def _write_temp_selection(selection: Dict[str, Any]) -> str:
-    fd, path = tempfile.mkstemp(prefix="random_selection_", suffix=".yaml")
+    fd, path = tempfile.mkstemp(prefix="tpe_selection_", suffix=".yaml")
     os.close(fd)
     _dump_yaml(selection, path)
     return path
@@ -181,6 +180,13 @@ def _evaluate_selection(
     }
 
 
+def _module_forced_on(algo_cfg: Dict[str, Any], module: str) -> bool:
+    if not isinstance(algo_cfg, dict):
+        return False
+    section = algo_cfg.get(module)
+    return isinstance(section, dict) and len(section) > 0
+
+
 def _random_selection(
     search_space: Dict[str, Any],
     algo_cfg: Dict[str, Any],
@@ -191,7 +197,7 @@ def _random_selection(
         if not isinstance(params, dict):
             continue
         is_optional = module in {"rewriter", "reranker", "pruner"}
-        if is_optional and rng.random() < 0.5:
+        if is_optional and not _module_forced_on(algo_cfg, module) and rng.random() < 0.5:
             continue
 
         selection[module] = {}
@@ -207,11 +213,176 @@ def _random_selection(
     return selection
 
 
-def _selection_key(selection: Dict[str, Any]) -> str:
-    return json.dumps(selection, sort_keys=True, ensure_ascii=False)
+def _build_param_specs(
+    search_space: Dict[str, Any],
+    algo_cfg: Dict[str, Any],
+    module_order: List[str],
+) -> List[Dict[str, Any]]:
+    specs: List[Dict[str, Any]] = []
+    for module in module_order:
+        params = search_space.get(module)
+        if not isinstance(params, dict):
+            continue
+        is_optional = module in {"rewriter", "reranker", "pruner"}
+        forced_on = _module_forced_on(algo_cfg, module)
+        if is_optional and not forced_on:
+            specs.append(
+                {
+                    "name": f"{module}.__enabled__",
+                    "module": module,
+                    "key": "__enabled__",
+                    "choices": [True, False],
+                    "is_enable": True,
+                }
+            )
+        for key, value in params.items():
+            choices = _allowed_values(value)
+            override = _override_choices(module, key, algo_cfg)
+            if override:
+                choices = override
+            if not choices:
+                continue
+            specs.append(
+                {
+                    "name": f"{module}.{key}",
+                    "module": module,
+                    "key": key,
+                    "choices": choices,
+                    "is_enable": False,
+                }
+            )
+    return specs
 
 
-def random_search(
+def _extract_param_values(
+    selection: Dict[str, Any], specs: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    values: Dict[str, Any] = {}
+    for spec in specs:
+        module = spec["module"]
+        if spec["is_enable"]:
+            values[spec["name"]] = module in selection
+            continue
+        if module in selection and isinstance(selection[module], dict):
+            values[spec["name"]] = selection[module].get(spec["key"])
+        else:
+            values[spec["name"]] = None
+    return values
+
+
+def _choice_weights(
+    choices: List[Any],
+    good_counts: Dict[Any, int],
+    bad_counts: Dict[Any, int],
+    n_good: int,
+    n_bad: int,
+    alpha: float,
+) -> List[float]:
+    weights: List[float] = []
+    for choice in choices:
+        p_good = (good_counts.get(choice, 0) + alpha) / (n_good + alpha * len(choices))
+        if n_bad > 0:
+            p_bad = (bad_counts.get(choice, 0) + alpha) / (n_bad + alpha * len(choices))
+        else:
+            p_bad = 1.0 / len(choices)
+        weights.append(p_good / p_bad if p_bad > 0 else p_good)
+    return weights
+
+
+def _sample_choice(rng: random.Random, choices: List[Any], weights: List[float]) -> Any:
+    total = sum(weights)
+    if total <= 0:
+        return rng.choice(choices)
+    r = rng.random() * total
+    upto = 0.0
+    for choice, weight in zip(choices, weights):
+        upto += weight
+        if r <= upto:
+            return choice
+    return choices[-1]
+
+
+def _sample_tpe_selection(
+    trials: List[Dict[str, Any]],
+    specs: List[Dict[str, Any]],
+    rng: random.Random,
+    gamma: float,
+    alpha: float,
+) -> Dict[str, Any]:
+    if not trials:
+        return {}
+    sorted_trials = sorted(trials, key=lambda t: t.get("score", float("-inf")), reverse=True)
+    n_good = max(1, int(len(sorted_trials) * gamma))
+    good = sorted_trials[:n_good]
+    bad = sorted_trials[n_good:]
+
+    good_counts: Dict[str, Dict[Any, int]] = {}
+    bad_counts: Dict[str, Dict[Any, int]] = {}
+    for trial in good:
+        values = _extract_param_values(trial.get("selection", {}), specs)
+        for spec in specs:
+            name = spec["name"]
+            val = values.get(name)
+            if val is None:
+                continue
+            good_counts.setdefault(name, {})
+            good_counts[name][val] = good_counts[name].get(val, 0) + 1
+    for trial in bad:
+        values = _extract_param_values(trial.get("selection", {}), specs)
+        for spec in specs:
+            name = spec["name"]
+            val = values.get(name)
+            if val is None:
+                continue
+            bad_counts.setdefault(name, {})
+            bad_counts[name][val] = bad_counts[name].get(val, 0) + 1
+
+    values: Dict[str, Any] = {}
+    disabled_modules: set[str] = set()
+    for spec in specs:
+        module = spec["module"]
+        if module in disabled_modules and not spec["is_enable"]:
+            continue
+        choices = spec["choices"]
+        weights = _choice_weights(
+            choices,
+            good_counts.get(spec["name"], {}),
+            bad_counts.get(spec["name"], {}),
+            len(good),
+            len(bad),
+            alpha,
+        )
+        picked = _sample_choice(rng, choices, weights)
+        values[spec["name"]] = picked
+        if spec["is_enable"] and picked is False:
+            disabled_modules.add(module)
+    return values
+
+
+def _build_selection_from_values(
+    values: Dict[str, Any], specs: List[Dict[str, Any]]
+) -> Dict[str, Any]:
+    selection: Dict[str, Any] = {}
+    disabled_modules: set[str] = set()
+    for spec in specs:
+        module = spec["module"]
+        if spec["is_enable"]:
+            if values.get(spec["name"]) is False:
+                disabled_modules.add(module)
+            continue
+        if module in disabled_modules:
+            continue
+        value = values.get(spec["name"])
+        if value is None:
+            continue
+        selection.setdefault(module, {})
+        selection[module][spec["key"]] = value
+    if "chunking" not in selection:
+        selection["chunking"] = {}
+    return {k: v for k, v in selection.items() if v}
+
+
+def tpe_search(
     qa_json_path: str,
     corpus_json_path: str,
     template_path: str,
@@ -221,6 +392,9 @@ def random_search(
     samples: int,
     seed: int,
     score_weights: Optional[Dict[str, float]] = None,
+    startup_trials: int = 10,
+    gamma: float = 0.2,
+    alpha: float = 1.0,
 ) -> Dict[str, Any]:
     template = _load_yaml(template_path)
     search_space = template.get("rag_search_space") or {}
@@ -229,13 +403,17 @@ def random_search(
     preferred_metric = None
     if isinstance(algo_cfg, dict):
         preferred_metric = algo_cfg.get("score_metric") or algo_cfg.get("metric")
+
     rng = random.Random(seed)
     trials: List[Dict[str, Any]] = []
     best_score: float = float("-inf")
     best_config: Dict[str, Any] = {}
     seen: set[str] = set()
 
-    bar = tqdm(total=samples, desc="random", unit="trial") if tqdm else None
+    module_order = ["rewriter", "chunking", "retrieve", "reranker", "pruner", "generator"]
+    specs = _build_param_specs(search_space, algo_cfg, module_order)
+
+    bar = tqdm(total=samples, desc="tpe", unit="trial") if tqdm else None
 
     def _write_report_snapshot() -> None:
         report_dir = os.path.dirname(report_path)
@@ -253,17 +431,23 @@ def random_search(
     max_attempts = max(samples * 50, 100)
     while len(trials) < samples and attempts < max_attempts:
         attempts += 1
-        candidate = _random_selection(search_space, algo_cfg, rng)
+        if len(trials) < startup_trials:
+            candidate = _random_selection(search_space, algo_cfg, rng)
+        else:
+            values = _sample_tpe_selection(trials, specs, rng, gamma, alpha)
+            candidate = _build_selection_from_values(values, specs)
+            if not candidate:
+                candidate = _random_selection(search_space, algo_cfg, rng)
         if eval_metrics:
             candidate["eval_metrics"] = eval_metrics
         if algo_cfg:
             candidate = _deep_update(candidate, algo_cfg)
-        key = _selection_key(candidate)
+        key = json.dumps(candidate, sort_keys=True, ensure_ascii=False)
         if key in seen:
             continue
         seen.add(key)
 
-        print(f"\n[random] trial={len(trials)+1} selection={json.dumps(candidate, ensure_ascii=False)}")
+        print(f"\n[tpe] trial={len(trials)+1} selection={json.dumps(candidate, ensure_ascii=False)}")
         score, payload = _evaluate_selection(
             qa_json_path,
             corpus_json_path,
@@ -308,9 +492,9 @@ def main() -> None:
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     default_template = os.path.join(base_dir, "config.yaml")
     default_algo_config = os.path.join(os.path.dirname(__file__), "configforalgo.yaml")
-    default_report = os.path.join(base_dir, "outputs", "random_report.json")
+    default_report = os.path.join(base_dir, "outputs", "tpe_report.json")
 
-    parser = argparse.ArgumentParser(description="Random search for RAG hyperparameters.")
+    parser = argparse.ArgumentParser(description="TPE hyperparameter search for RAG.")
     parser.add_argument("--qa_json", required=True, help="Path to QA JSON/JSONL.")
     parser.add_argument("--corpus_json", required=True, help="Path to corpus JSON.")
     parser.add_argument(
@@ -327,7 +511,7 @@ def main() -> None:
     parser.add_argument(
         "--report_path",
         default=default_report,
-        help="Path to write random search report JSON.",
+        help="Path to write TPE report JSON.",
     )
     parser.add_argument(
         "--algo_config_yaml",
@@ -338,13 +522,31 @@ def main() -> None:
         "--samples",
         type=int,
         default=20,
-        help="Number of random configurations to evaluate.",
+        help="Number of configurations to evaluate.",
     )
     parser.add_argument(
         "--seed",
         type=int,
         default=42,
         help="Random seed.",
+    )
+    parser.add_argument(
+        "--startup_trials",
+        type=int,
+        default=10,
+        help="Number of random trials before TPE sampling.",
+    )
+    parser.add_argument(
+        "--gamma",
+        type=float,
+        default=0.2,
+        help="Fraction of good trials to model.",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=1.0,
+        help="Smoothing for categorical probabilities.",
     )
     parser.add_argument(
         "--score_weights",
@@ -354,7 +556,7 @@ def main() -> None:
     args = parser.parse_args()
 
     score_weights = _parse_score_weights(args.score_weights)
-    random_search(
+    tpe_search(
         qa_json_path=args.qa_json,
         corpus_json_path=args.corpus_json,
         template_path=args.config_yaml,
@@ -364,6 +566,9 @@ def main() -> None:
         samples=args.samples,
         seed=args.seed,
         score_weights=score_weights,
+        startup_trials=args.startup_trials,
+        gamma=args.gamma,
+        alpha=args.alpha,
     )
 
 

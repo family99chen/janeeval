@@ -230,7 +230,7 @@ def run_reranker_stage(
             return candidates
         return rerank(query=query, candidates=candidates, model_url=model_url, topk=topk)
     except Exception:
-        return []
+        return candidates
 
 
 async def run_reranker_stage_async(
@@ -251,7 +251,7 @@ async def run_reranker_stage_async(
             query=query, candidates=candidates, model_url=model_url, topk=topk
         )
     except Exception:
-        return []
+        return candidates
 
 
 def run_generator_stage(query: str, selection_path: str, context: str) -> str:

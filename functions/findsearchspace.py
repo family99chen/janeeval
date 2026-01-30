@@ -94,8 +94,8 @@ def get_search_space(config_path: str) -> Dict[str, Any]:
         "Prompt templates must be chosen by ID and map to the fixed templates below.",
         "Evaluation resources can be provided under eval_metrics.llmaaj and eval_metrics.bert.",
         "Use the template below to create a selection YAML file.",
-        "Required: retrieve.model_url, retrieve.topk, retrieve.bm25_weight, generator.model_url.",
-        "Optional sections: rewriter, reranker, pruner, chunking (can be omitted or partial).",
+        "Required: retrieve.model_url, retrieve.topk, retrieve.bm25_weight, chunking.chunk_size, generator.model_url.",
+        "Optional sections: rewriter, reranker, pruner (can be omitted or partial).",
         "To run a search, the user should submit a YAML file path with chosen values.",
     ]
 

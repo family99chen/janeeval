@@ -243,7 +243,7 @@ def _count_greedy_steps(search_space: Dict[str, Any], algo_cfg: Dict[str, Any]) 
         if not isinstance(params, dict):
             continue
         # optional modules get an on/off decision step
-        if section in {"rewriter", "chunking", "reranker", "pruner"}:
+        if section in {"rewriter", "reranker", "pruner"}:
             total += 1
         for key, value in params.items():
             choices = _allowed_values(value)
@@ -334,7 +334,7 @@ def greedy_search(
         if not isinstance(params, dict):
             continue
 
-        is_optional = module in {"rewriter", "chunking", "reranker", "pruner"}
+        is_optional = module in {"rewriter", "reranker", "pruner"}
         score_off = float("-inf")
         if is_optional:
             candidate = dict(current)

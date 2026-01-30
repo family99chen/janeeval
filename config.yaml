@@ -24,7 +24,7 @@ rag_search_space:
 
   chunking:
     chunk_size:
-      allowed: [256, 512, 768, 1024]
+      allowed: [256, 512, 1024, 2048]
     chunk_overlap:
       allowed: [0, 64, 128, 192]
 
