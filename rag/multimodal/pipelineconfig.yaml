@@ -1,0 +1,11 @@
+generator:
+  prompt: "You are a helpful assistant. Answer the question using only the provided context. If the answer is not in the context, say you do not know."
+
+concurrency:
+  max_tasks: 20
+
+llmaaj:
+  prompt: "You are a judge. Determine if the answer is correct based on the reference.\nRules:\n- Output only 1 for correct or 0 for incorrect.\nQuery: {query}\nReference: {reference}\nAnswer: {answer}"
+
+eval:
+  max_workers: 20

@@ -1,8 +1,10 @@
 import asyncio
+import base64
 from dataclasses import dataclass
 import json
 import os
-from typing import Any, Dict, Optional, Tuple
+import mimetypes
+from typing import Any, Dict, List, Optional, Tuple
 import yaml
 from urllib import request
 from urllib.error import HTTPError, URLError
@@ -34,6 +36,27 @@ class ApiLLM:
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
+
+    def _image_to_data_url(self, path: str) -> str:
+        mime, _ = mimetypes.guess_type(path)
+        mime = mime or "application/octet-stream"
+        with open(path, "rb") as handle:
+            data = base64.b64encode(handle.read()).decode("utf-8")
+        return f"data:{mime};base64,{data}"
+
+    def _build_image_content(self, images: List[str]) -> List[Dict[str, Any]]:
+        content: List[Dict[str, Any]] = []
+        for item in images:
+            if not item:
+                continue
+            if item.startswith("http://") or item.startswith("https://"):
+                content.append({"type": "image_url", "image_url": {"url": item}})
+                continue
+            if os.path.isfile(item):
+                content.append(
+                    {"type": "image_url", "image_url": {"url": self._image_to_data_url(item)}}
+                )
+        return content
 
     def _request_json(self, method: str, url: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         data = None
@@ -95,6 +118,64 @@ class ApiLLM:
             return data["choices"][0]["message"]["content"]
         except Exception:
             return ""
+
+    def generate_multimodal(
+        self,
+        prompt: str,
+        images: List[str],
+        system: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        default_temperature, default_max_tokens, default_timeout = self._load_defaults()
+        if temperature is None:
+            temperature = default_temperature
+        if max_tokens is None:
+            max_tokens = default_max_tokens
+        if default_timeout is not None:
+            self.timeout = default_timeout
+        try:
+            model = self._resolve_model_name()
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+
+            user_content: List[Dict[str, Any]] = []
+            if prompt:
+                user_content.append({"type": "text", "text": prompt})
+            user_content.extend(self._build_image_content(images))
+            if not user_content:
+                return ""
+
+            messages.append({"role": "user", "content": user_content})
+            payload = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            url = self.url.rstrip("/") + "/chat/completions"
+            data = self._request_json("POST", url, payload)
+            return data["choices"][0]["message"]["content"]
+        except Exception:
+            return ""
+
+    async def generate_multimodal_async(
+        self,
+        prompt: str,
+        images: List[str],
+        system: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        return await asyncio.to_thread(
+            self.generate_multimodal,
+            prompt,
+            images,
+            system=system,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
 
     async def generate_async(
         self,

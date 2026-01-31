@@ -32,6 +32,25 @@ def _find_config_path() -> str:
     raise FileNotFoundError("config.yaml not found. Set RAGSEARCH_CONFIG to override.")
 
 
+def _find_multimodal_config_path() -> str:
+    env_path = os.getenv("RAGSEARCH_CONFIG_MULTIMODAL")
+    if env_path:
+        return os.path.abspath(env_path)
+
+    current = os.path.abspath(os.path.dirname(__file__))
+    while True:
+        candidate = os.path.join(current, "config_multimodal.yaml")
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    raise FileNotFoundError(
+        "config_multimodal.yaml not found. Set RAGSEARCH_CONFIG_MULTIMODAL to override."
+    )
+
+
 def _is_scalar(value: Any) -> bool:
     return isinstance(value, (str, int, float, bool))
 
@@ -138,6 +157,48 @@ def check_config(selection_path: str, config_path: str | None = None) -> Dict[st
     }
 
 
+def check_config_multimodal(
+    selection_path: str, config_path: str | None = None
+) -> Dict[str, Any]:
+    config_path = config_path or _find_multimodal_config_path()
+    config = _load_yaml(config_path)
+    search_space = config.get("rag_search_space", {})
+    eval_metrics = config.get("eval_metrics", {})
+
+    selection = _load_yaml(selection_path)
+
+    errors: List[str] = []
+    required_paths: Set[str] = {
+        "selection.retrieve",
+        "selection.retrieve.model_url",
+        "selection.retrieve.topk",
+        "selection.retrieve.bm25_weight",
+        "selection.chunking",
+        "selection.chunking.chunk_size",
+        "selection.clip",
+        "selection.clip.model_url",
+        "selection.generator",
+        "selection.generator.model_url",
+    }
+
+    selection_for_search = dict(selection)
+    selection_for_search.pop("eval_metrics", None)
+    _validate_node(selection_for_search, search_space, "selection", errors, required_paths)
+    if "eval_metrics" in selection:
+        _validate_node(
+            selection.get("eval_metrics"),
+            eval_metrics,
+            "selection.eval_metrics",
+            errors,
+            set(),
+        )
+
+    return {
+        "is_valid": len(errors) == 0,
+        "errors": errors,
+    }
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         selection_path = os.path.abspath(
@@ -145,7 +206,11 @@ def main() -> None:
         )
     else:
         selection_path = sys.argv[1]
-    result = check_config(selection_path)
+    mode = os.getenv("RAGSEARCH_MODE", "text").lower()
+    if mode == "multimodal":
+        result = check_config_multimodal(selection_path)
+    else:
+        result = check_config(selection_path)
     print(yaml.safe_dump(result, sort_keys=False))
 
 

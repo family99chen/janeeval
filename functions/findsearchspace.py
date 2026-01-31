@@ -31,6 +31,25 @@ def _find_config_path() -> str:
     raise FileNotFoundError("config.yaml not found. Set RAGSEARCH_CONFIG to override.")
 
 
+def _find_multimodal_config_path() -> str:
+    env_path = os.getenv("RAGSEARCH_CONFIG_MULTIMODAL")
+    if env_path:
+        return os.path.abspath(env_path)
+
+    current = os.path.abspath(os.path.dirname(__file__))
+    while True:
+        candidate = os.path.join(current, "config_multimodal.yaml")
+        if os.path.isfile(candidate):
+            return candidate
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    raise FileNotFoundError(
+        "config_multimodal.yaml not found. Set RAGSEARCH_CONFIG_MULTIMODAL to override."
+    )
+
+
 def _pick_first_allowed(allowed: List[Any]) -> Any:
     for item in allowed:
         if item != "...":
@@ -73,6 +92,34 @@ def _render_template(data: Dict[str, Any], indent: int = 0) -> str:
     return "\n".join(lines)
 
 
+def _build_description(is_multimodal: bool) -> List[str]:
+    base = [
+        "This endpoint lists all searchable RAG hyperparameters.",
+        "All selectable values are constrained to the 'allowed' lists in config.yaml.",
+        "Model URL can be provided at runtime.",
+        "Model name and API key are optional and only required when using an API.",
+        "Prompt templates must be chosen by ID and map to the fixed templates below.",
+        "Evaluation resources can be provided under eval_metrics.llmaaj and eval_metrics.bert.",
+        "Use the template below to create a selection YAML file.",
+    ]
+    if is_multimodal:
+        base.extend(
+            [
+                "Required: retrieve.model_url, retrieve.topk, retrieve.bm25_weight, chunking.chunk_size, generator.model_url, clip.model_url.",
+                "Optional sections: rewriter, reranker (can be omitted or partial).",
+            ]
+        )
+    else:
+        base.extend(
+            [
+                "Required: retrieve.model_url, retrieve.topk, retrieve.bm25_weight, chunking.chunk_size, generator.model_url.",
+                "Optional sections: rewriter, reranker, pruner (can be omitted or partial).",
+            ]
+        )
+    base.append("To run a search, the user should submit a YAML file path with chosen values.")
+    return base
+
+
 def get_search_space(config_path: str) -> Dict[str, Any]:
     """
     Return the searchable hyperparameter space plus user-facing guidance.
@@ -86,18 +133,7 @@ def get_search_space(config_path: str) -> Dict[str, Any]:
         selection_template["eval_metrics"] = _build_selection_template(eval_metrics)
     selection_template_text = _render_template(selection_template)
 
-    description = [
-        "This endpoint lists all searchable RAG hyperparameters.",
-        "All selectable values are constrained to the 'allowed' lists in config.yaml.",
-        "Model URL can be provided at runtime.",
-        "Model name and API key are optional and only required when using an API.",
-        "Prompt templates must be chosen by ID and map to the fixed templates below.",
-        "Evaluation resources can be provided under eval_metrics.llmaaj and eval_metrics.bert.",
-        "Use the template below to create a selection YAML file.",
-        "Required: retrieve.model_url, retrieve.topk, retrieve.bm25_weight, chunking.chunk_size, generator.model_url.",
-        "Optional sections: rewriter, reranker, pruner (can be omitted or partial).",
-        "To run a search, the user should submit a YAML file path with chosen values.",
-    ]
+    description = _build_description(is_multimodal=False)
 
     response_format = {
         "selection_yaml_path": "<absolute-or-relative-path-to-selection.yaml>"
@@ -112,9 +148,40 @@ def get_search_space(config_path: str) -> Dict[str, Any]:
     }
 
 
+def get_search_space_multimodal(config_path: str) -> Dict[str, Any]:
+    """
+    Return the searchable multimodal hyperparameter space plus user-facing guidance.
+    """
+    config = _load_yaml(config_path)
+    search_space = config.get("rag_search_space", {})
+    prompt_templates = config.get("prompt_templates", {})
+    eval_metrics = config.get("eval_metrics", {})
+    selection_template = _build_selection_template(search_space)
+    if eval_metrics:
+        selection_template["eval_metrics"] = _build_selection_template(eval_metrics)
+    selection_template_text = _render_template(selection_template)
+
+    response_format = {
+        "selection_yaml_path": "<absolute-or-relative-path-to-selection.yaml>"
+    }
+
+    return {
+        "description": _build_description(is_multimodal=True),
+        "search_space": search_space,
+        "prompt_templates": prompt_templates,
+        "selection_template_text": selection_template_text,
+        "response_format": response_format,
+    }
+
+
 def main() -> None:
-    config_path = _find_config_path()
-    payload = get_search_space(config_path)
+    mode = os.getenv("RAGSEARCH_MODE", "text").lower()
+    if mode == "multimodal":
+        config_path = _find_multimodal_config_path()
+        payload = get_search_space_multimodal(config_path)
+    else:
+        config_path = _find_config_path()
+        payload = get_search_space(config_path)
     selection_template_text = payload.pop("selection_template_text")
     print(yaml.safe_dump(payload, sort_keys=False))
     print("selection_template_text:")

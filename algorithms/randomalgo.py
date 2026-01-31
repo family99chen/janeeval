@@ -10,7 +10,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from mainfunction import evaluate_rag
+from mainfunction import evaluate_rag, evaluate_rag_multimodal
 
 try:
     from tqdm import tqdm
@@ -144,6 +144,81 @@ def _score_from_report(
     return "LLMAAJ", 0.0
 
 
+def _is_multimodal(algo_cfg: Dict[str, Any]) -> bool:
+    return isinstance(algo_cfg, dict) and isinstance(algo_cfg.get("clip"), dict)
+
+
+def _module_forced_on(algo_cfg: Dict[str, Any], module: str) -> bool:
+    if not isinstance(algo_cfg, dict):
+        return False
+    section = algo_cfg.get(module)
+    return isinstance(section, dict) and len(section) > 0
+
+
+def _param_choices(value: Any, override: Optional[List[Any]]) -> List[Any]:
+    if override:
+        return override
+    allowed = _allowed_values(value)
+    if allowed:
+        return allowed
+    if isinstance(value, dict):
+        return []
+    return [value]
+
+
+def _build_module_variants(
+    module: str,
+    params: Dict[str, Any],
+    algo_cfg: Dict[str, Any],
+    is_optional: bool,
+) -> List[Optional[Dict[str, Any]]]:
+    forced_on = _module_forced_on(algo_cfg, module)
+    keys: List[str] = []
+    choices_list: List[List[Any]] = []
+    for key, value in params.items():
+        override = _override_choices(module, key, algo_cfg)
+        choices = _param_choices(value, override)
+        if not choices:
+            continue
+        keys.append(key)
+        choices_list.append(choices)
+
+    variants: List[Dict[str, Any]] = []
+    if not keys:
+        variants.append({})
+    else:
+        def _build(idx: int, current: Dict[str, Any]) -> None:
+            if idx == len(keys):
+                variants.append(dict(current))
+                return
+            key = keys[idx]
+            for choice in choices_list[idx]:
+                current[key] = choice
+                _build(idx + 1, current)
+            current.pop(key, None)
+
+        _build(0, {})
+
+    if is_optional and not forced_on:
+        return [None] + variants
+    return variants
+
+
+def _filter_algo_cfg(
+    algo_cfg: Dict[str, Any],
+    selection: Dict[str, Any],
+    optional_modules: set[str],
+) -> Dict[str, Any]:
+    if not isinstance(algo_cfg, dict):
+        return {}
+    filtered: Dict[str, Any] = {}
+    for key, value in algo_cfg.items():
+        if key in optional_modules and key not in selection:
+            continue
+        filtered[key] = value
+    return filtered
+
+
 def _write_temp_selection(selection: Dict[str, Any]) -> str:
     fd, path = tempfile.mkstemp(prefix="random_selection_", suffix=".yaml")
     os.close(fd)
@@ -158,10 +233,11 @@ def _evaluate_selection(
     eval_mode: str,
     preferred_metric: Optional[str],
     score_weights: Optional[Dict[str, float]],
+    eval_fn,
 ) -> Tuple[float, Dict[str, Any]]:
     selection_path = _write_temp_selection(selection)
     try:
-        result = evaluate_rag(
+        result = eval_fn(
             qa_json_path=qa_json_path,
             corpus_json_path=corpus_json_path,
             config_path=selection_path,
@@ -191,7 +267,7 @@ def _random_selection(
         if not isinstance(params, dict):
             continue
         is_optional = module in {"rewriter", "reranker", "pruner"}
-        if is_optional and rng.random() < 0.5:
+        if is_optional and not _module_forced_on(algo_cfg, module) and rng.random() < 0.5:
             continue
 
         selection[module] = {}
@@ -229,13 +305,52 @@ def random_search(
     preferred_metric = None
     if isinstance(algo_cfg, dict):
         preferred_metric = algo_cfg.get("score_metric") or algo_cfg.get("metric")
+    use_multimodal = _is_multimodal(algo_cfg)
+    eval_fn = evaluate_rag_multimodal if use_multimodal else evaluate_rag
+    if use_multimodal and template_path.endswith("config.yaml"):
+        template_path = os.path.join(os.path.dirname(template_path), "config_multimodal.yaml")
+        template = _load_yaml(template_path)
+        search_space = template.get("rag_search_space") or {}
+        eval_metrics = template.get("eval_metrics")
     rng = random.Random(seed)
     trials: List[Dict[str, Any]] = []
     best_score: float = float("-inf")
     best_config: Dict[str, Any] = {}
-    seen: set[str] = set()
 
-    bar = tqdm(total=samples, desc="random", unit="trial") if tqdm else None
+    optional_modules = {"rewriter", "reranker", "pruner"}
+    all_configs: List[Dict[str, Any]] = [{}]
+    for module, params in search_space.items():
+        if not isinstance(params, dict):
+            continue
+        is_optional = module in optional_modules
+        variants = _build_module_variants(module, params, algo_cfg, is_optional)
+        next_configs: List[Dict[str, Any]] = []
+        for base in all_configs:
+            for variant in variants:
+                if variant is None:
+                    next_configs.append(dict(base))
+                else:
+                    merged = json.loads(json.dumps(base))
+                    merged[module] = variant
+                    next_configs.append(merged)
+        all_configs = next_configs
+
+    if eval_metrics:
+        for config in all_configs:
+            config["eval_metrics"] = eval_metrics
+    if algo_cfg:
+        for idx, config in enumerate(all_configs):
+            filtered_cfg = _filter_algo_cfg(algo_cfg, config, optional_modules)
+            all_configs[idx] = _deep_update(config, filtered_cfg)
+
+    report_total = len(all_configs)
+    print(f"[random] total_configurations={report_total}")
+
+    rng.shuffle(all_configs)
+    if samples > 0:
+        all_configs = all_configs[: min(samples, len(all_configs))]
+
+    bar = tqdm(total=len(all_configs), desc="random", unit="trial") if tqdm else None
 
     def _write_report_snapshot() -> None:
         report_dir = os.path.dirname(report_path)
@@ -245,25 +360,14 @@ def random_search(
             "best_score": best_score,
             "best_config": best_config,
             "trials": trials,
+            "total_configurations": report_total,
+            "all_configurations": all_configs,
         }
         with open(report_path, "w", encoding="utf-8") as handle:
             json.dump(snapshot, handle, ensure_ascii=False, indent=2)
 
-    attempts = 0
-    max_attempts = max(samples * 50, 100)
-    while len(trials) < samples and attempts < max_attempts:
-        attempts += 1
-        candidate = _random_selection(search_space, algo_cfg, rng)
-        if eval_metrics:
-            candidate["eval_metrics"] = eval_metrics
-        if algo_cfg:
-            candidate = _deep_update(candidate, algo_cfg)
-        key = _selection_key(candidate)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        print(f"\n[random] trial={len(trials)+1} selection={json.dumps(candidate, ensure_ascii=False)}")
+    for idx, candidate in enumerate(all_configs):
+        print(f"\n[random] trial={idx+1} selection={json.dumps(candidate, ensure_ascii=False)}")
         score, payload = _evaluate_selection(
             qa_json_path,
             corpus_json_path,
@@ -271,9 +375,10 @@ def random_search(
             eval_mode,
             preferred_metric,
             score_weights,
+            eval_fn,
         )
         record = {
-            "index": len(trials) + 1,
+            "index": idx + 1,
             "score": payload.get("score"),
             "metric": payload.get("metric"),
             "selection": candidate,

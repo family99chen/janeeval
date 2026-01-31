@@ -9,7 +9,7 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from mainfunction import evaluate_rag
+from mainfunction import evaluate_rag, evaluate_rag_multimodal
 
 try:
     from tqdm import tqdm
@@ -49,13 +49,20 @@ def _allowed_values(node: Any) -> List[Any]:
 def _deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     merged = json.loads(json.dumps(base))
     for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_update(merged[key], value)
-        elif isinstance(value, list):
+        if isinstance(value, dict):
+            current = merged.get(key)
+            if not isinstance(current, dict):
+                current = {}
+            merged_child = _deep_update(current, value)
+            if merged_child:
+                merged[key] = merged_child
+            else:
+                merged.pop(key, None)
+            continue
+        if isinstance(value, list):
             # Lists in algo config are candidate pools, not fixed values.
             continue
-        else:
-            merged[key] = value
+        merged[key] = value
     return merged
 
 
@@ -150,6 +157,10 @@ def _write_temp_selection(selection: Dict[str, Any]) -> str:
     return path
 
 
+def _is_multimodal(algo_cfg: Dict[str, Any]) -> bool:
+    return isinstance(algo_cfg, dict) and "clip" in algo_cfg
+
+
 def _evaluate_selection(
     qa_json_path: str,
     corpus_json_path: str,
@@ -157,10 +168,11 @@ def _evaluate_selection(
     eval_mode: str,
     preferred_metric: Optional[str],
     score_weights: Optional[Dict[str, float]],
+    eval_fn,
 ) -> Tuple[float, Dict[str, Any]]:
     selection_path = _write_temp_selection(selection)
     try:
-        result = evaluate_rag(
+        result = eval_fn(
             qa_json_path=qa_json_path,
             corpus_json_path=corpus_json_path,
             config_path=selection_path,
@@ -396,10 +408,15 @@ def tpe_search(
     gamma: float = 0.2,
     alpha: float = 1.0,
 ) -> Dict[str, Any]:
+    algo_cfg = _load_yaml(algo_config_path)
+    use_multimodal = _is_multimodal(algo_cfg)
+    eval_fn = evaluate_rag_multimodal if use_multimodal else evaluate_rag
+    if use_multimodal:
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        template_path = os.path.join(base_dir, "config_multimodal.yaml")
     template = _load_yaml(template_path)
     search_space = template.get("rag_search_space") or {}
     eval_metrics = template.get("eval_metrics")
-    algo_cfg = _load_yaml(algo_config_path)
     preferred_metric = None
     if isinstance(algo_cfg, dict):
         preferred_metric = algo_cfg.get("score_metric") or algo_cfg.get("metric")
@@ -410,7 +427,7 @@ def tpe_search(
     best_config: Dict[str, Any] = {}
     seen: set[str] = set()
 
-    module_order = ["rewriter", "chunking", "retrieve", "reranker", "pruner", "generator"]
+    module_order = ["rewriter", "chunking", "retrieve", "clip", "reranker", "pruner", "generator"]
     specs = _build_param_specs(search_space, algo_cfg, module_order)
 
     bar = tqdm(total=samples, desc="tpe", unit="trial") if tqdm else None
@@ -455,6 +472,7 @@ def tpe_search(
             eval_mode,
             preferred_metric,
             score_weights,
+            eval_fn,
         )
         record = {
             "index": len(trials) + 1,

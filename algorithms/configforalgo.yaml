@@ -1,7 +1,7 @@
 rewriter:
   model_url: "https://api.zhizengzeng.com/v1"
   model_name: "gpt-4o-mini"
-  api_key: "sk-zk2a9670ffd66cd147a52dca250662f1334694f88bae25e4"
+  api_key: "sk-zk2f7a5868c06b406c9313170ae2852fc2a697c2f28cf9e6"
 
 retrieve:
   model_url:
@@ -18,17 +18,17 @@ pruner:
     - "https://api.zhizengzeng.com/v1"
   model_name:
     - "gpt-4o-mini"
-  api_key: "sk-zk2a9670ffd66cd147a52dca250662f1334694f88bae25e4"
+  api_key: "sk-zk2f7a5868c06b406c9313170ae2852fc2a697c2f28cf9e6"
 
 generator:
   model_url: "https://api.zhizengzeng.com/v1"
   model_name: "gpt-4o-mini"
-  api_key: "sk-zk2a9670ffd66cd147a52dca250662f1334694f88bae25e4"
+  api_key: "sk-zk2f7a5868c06b406c9313170ae2852fc2a697c2f28cf9e6"
 
 eval_metrics:
   llmaaj:
     model_url: "https://api.zhizengzeng.com/v1"
     model_name: "gpt-4o-mini"
-    api_key: "sk-zk2a9670ffd66cd147a52dca250662f1334694f88bae25e4"
+    api_key: "sk-zk2f7a5868c06b406c9313170ae2852fc2a697c2f28cf9e6"
   bert:
     model_url: "/home/cz/ragsearch-jane/models/bert-base-uncased"

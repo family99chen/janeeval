@@ -4,6 +4,7 @@ import os
 import sys
 import uuid
 import gc
+import tempfile
 from typing import Any, Dict, List
 
 import yaml
@@ -66,6 +67,84 @@ def _load_json(path: str) -> List[Dict[str, Any]]:
     if not isinstance(data, list):
         raise ValueError("JSON root must be a list of records.")
     return data
+
+
+def _pick_first(value: Any) -> Any:
+    if isinstance(value, list):
+        return value[0] if value else None
+    if isinstance(value, dict) and "allowed" in value:
+        allowed = value.get("allowed")
+        if isinstance(allowed, list):
+            for item in allowed:
+                if item != "...":
+                    return item
+            return allowed[0] if allowed else None
+    return value
+
+
+def _build_upperbound_selection_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    selection: Dict[str, Any] = {}
+    generator = config.get("generator")
+    if not isinstance(generator, dict):
+        generator = (config.get("rag_search_space") or {}).get("generator")
+    if isinstance(generator, dict):
+        model_url = _pick_first(generator.get("model_url"))
+        model_name = _pick_first(generator.get("model_name"))
+        api_key = _pick_first(generator.get("api_key"))
+        if model_url:
+            selection["generator"] = {"model_url": str(model_url)}
+            if model_name:
+                selection["generator"]["model_name"] = str(model_name)
+            if api_key:
+                selection["generator"]["api_key"] = str(api_key)
+
+    eval_metrics = config.get("eval_metrics")
+    if isinstance(eval_metrics, dict):
+        selection["eval_metrics"] = eval_metrics
+    return selection
+
+
+def _extract_upperbound_contexts(
+    qa_items: List[Dict[str, Any]], corpus_items: List[Dict[str, Any]]
+) -> List[str]:
+    corpus_by_id: Dict[str, str] = {}
+    corpus_ids: List[str] = []
+    for item in corpus_items:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id") or item.get("qid") or item.get("doc_id")
+        content = item.get("content")
+        if item_id is None or content is None:
+            continue
+        item_id_str = str(item_id)
+        corpus_by_id[item_id_str] = str(content)
+        corpus_ids.append(item_id_str)
+
+    contexts: List[str] = []
+    for idx, qa in enumerate(qa_items):
+        if not isinstance(qa, dict):
+            contexts.append("")
+            continue
+        qa_id = qa.get("id") or qa.get("qid") or qa.get("doc_id")
+        if qa_id is not None:
+            qa_id_str = str(qa_id)
+            exact = corpus_by_id.get(qa_id_str)
+            if exact is not None:
+                contexts.append(exact)
+                continue
+            matched = [
+                corpus_by_id[cid]
+                for cid in corpus_ids
+                if cid == qa_id_str or cid.startswith(f"{qa_id_str}_")
+            ]
+            if matched:
+                contexts.append("\n".join(matched))
+                continue
+        if idx < len(corpus_items):
+            contexts.append(str(corpus_items[idx].get("content", "")))
+        else:
+            contexts.append("")
+    return contexts
 
 
 def run_chunking_stage(
@@ -390,6 +469,96 @@ async def run_batch_async(
             except Exception:
                 pass
         gc.collect()
+
+
+async def getupperbound_external_async(
+    qa_json_path: str,
+    corpus_json_path: str,
+    config_path: str,
+    eval_mode: str = "both",
+) -> Dict[str, Any]:
+    config = _load_yaml(config_path)
+    selection = _build_upperbound_selection_from_config(config)
+    fd, selection_path = tempfile.mkstemp(prefix="upperbound_ext_", suffix=".yaml")
+    os.close(fd)
+    with open(selection_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(selection, handle, sort_keys=False, allow_unicode=True)
+    try:
+        qa_items = _load_json(qa_json_path)
+        corpus_items = _load_json(corpus_json_path)
+        contexts = _extract_upperbound_contexts(qa_items, corpus_items)
+
+        queries: List[str] = []
+        references_list: List[List[str]] = []
+        for item in qa_items:
+            query = item.get("query") or item.get("question")
+            queries.append("" if query is None else str(query))
+            refs = item.get("references") or item.get("answers") or item.get("reference")
+            if refs is None:
+                references_list.append([])
+            elif isinstance(refs, list):
+                references_list.append([str(r) for r in refs])
+            else:
+                references_list.append([str(refs)])
+
+        config_pipeline = _load_pipeline_config()
+        max_tasks = int(config_pipeline.get("concurrency", {}).get("max_tasks", 8))
+        semaphore = asyncio.Semaphore(max_tasks)
+
+        async def _run_one(q: str, ctx: str) -> Dict[str, Any]:
+            async with semaphore:
+                answer = await run_generator_stage_async(q, selection_path, ctx)
+                return {"query": q, "context": ctx, "answer": answer}
+
+        tasks = [
+            asyncio.create_task(_run_one(q, ctx))
+            for q, ctx in zip(queries, contexts)
+        ]
+        outputs: List[Dict[str, Any]] = []
+        total = len(tasks)
+        if tqdm is not None:
+            with tqdm(total=total, desc="upperbound", unit="qa") as bar:
+                for coro in asyncio.as_completed(tasks):
+                    result_item = await coro
+                    outputs.append(result_item)
+                    bar.update(1)
+        else:
+            completed = 0
+            for coro in asyncio.as_completed(tasks):
+                result_item = await coro
+                outputs.append(result_item)
+                completed += 1
+                print(f"\rprogress: {completed}/{total}", end="", flush=True)
+            if total > 0:
+                print()
+
+        eval_cfg = selection.get("eval_metrics")
+        report = evaluate_report(
+            preds=[o.get("answer", "") for o in outputs],
+            refs_list=references_list,
+            queries=queries,
+            mode=eval_mode,
+            eval_cfg=eval_cfg,
+        )
+        return {"outputs": outputs, "report": report}
+    finally:
+        os.remove(selection_path)
+
+
+def getupperbound_external(
+    qa_json_path: str,
+    corpus_json_path: str,
+    config_path: str,
+    eval_mode: str = "both",
+) -> Dict[str, Any]:
+    return asyncio.run(
+        getupperbound_external_async(
+            qa_json_path=qa_json_path,
+            corpus_json_path=corpus_json_path,
+            config_path=config_path,
+            eval_mode=eval_mode,
+        )
+    )
 
 
 def main() -> None:
