@@ -1,9 +1,9 @@
 
 rag_search_space:
   rewriter:
-    model_url: ["https://api.zhizengzeng.com/v1"]
-    model_name: ["gpt-4o-mini"]
-    api_key: "sk-zk2f7a5868c06b406c9313170ae2852fc2a697c2f28cf9e6"
+    model_url: ["http://localhost:9000/v1"]
+    #model_name: ["gpt-4o-mini"]
+    #api_key: "sk-zk2f7a5868c06b406c9313170ae2852fc2a697c2f28cf9e6"
     prompt_template_id: ["1", "2", "3"]
 
   chunking:
@@ -20,20 +20,20 @@ rag_search_space:
     topk: [1, 3, 5, 10, 20, 50]
 
   pruner:
-    model_url: ["https://api.zhizengzeng.com/v1"]
-    model_name: ["gpt-4o-mini"]
-    api_key: "sk-zk2f7a5868c06b406c9313170ae2852fc2a697c2f28cf9e6"
+    model_url: ["http://localhost:9000/v1"]
+    #model_name: ["gpt-4o-mini"]
+    #api_key: "sk-zk2f7a5868c06b406c9313170ae2852fc2a697c2f28cf9e6"
     prompt_template_id: ["1", "2", "3"]
 
   generator:
-    model_url: ["http://localhost:9000"]
+    model_url: ["http://localhost:9000/v1"]
     #model_name: ["gpt-4o-mini"]
     #api_key: "sk-zk2f7a5868c06b406c9313170ae2852fc2a697c2f28cf9e6"
 
 eval_metrics:
   llmaaj:
-    model_url: "https://api.zhizengzeng.com/v1"
-    model_name: "gpt-4o-mini"
-    api_key: "sk-zk2f7a5868c06b406c9313170ae2852fc2a697c2f28cf9e6"
+    model_url: "http://localhost:9000/v1"
+    #model_name: "gpt-4o-mini"
+    #api_key: "sk-zk2f7a5868c06b406c9313170ae2852fc2a697c2f28cf9e6"
   bert:
     model_url: "/home/cz/ragsearch-jane/models/bert-base-uncased"
