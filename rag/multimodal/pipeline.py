@@ -5,7 +5,8 @@ import sys
 import uuid
 import gc
 import tempfile
-from typing import Any, Dict, List
+import time
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -24,18 +25,22 @@ try:
     from rag.multimodal.models.retriever import retrieve, retrieve_async
     from rag.multimodal.models.rewriter import rewrite_query, rewrite_query_async
     from rag.multimodal.models.chunking import build_chroma_db, build_chroma_db_async
-    from rag.multimodal.models.reranker import rerank, rerank_async
+    from rag.multimodal.models.reranker import (
+        rerank,
+        rerank_async,
+        clear_reranker_cache,
+    )
     from rag.multimodal.models.generator import generate_answer, generate_answer_async
-    from rag.multimodal.models.eval import evaluate_report
+    from rag.multimodal.models.eval import evaluate_report, clear_eval_cache
 except ModuleNotFoundError:
     from models.clip import build_clip_chroma_db
     from models.multimodalretreiver import retrieve_images, retrieve_images_async
     from models.retriever import retrieve, retrieve_async
     from models.rewriter import rewrite_query, rewrite_query_async
     from models.chunking import build_chroma_db, build_chroma_db_async
-    from models.reranker import rerank, rerank_async
+    from models.reranker import rerank, rerank_async, clear_reranker_cache
     from models.generator import generate_answer, generate_answer_async
-    from models.eval import evaluate_report
+    from models.eval import evaluate_report, clear_eval_cache
 
 try:
     import torch
@@ -74,6 +79,106 @@ def _load_json(path: str) -> List[Dict[str, Any]]:
     if not isinstance(data, list):
         raise ValueError("JSON root must be a list of records.")
     return data
+
+
+def _pick_first(value: Any) -> Any:
+    if isinstance(value, list):
+        return value[0] if value else None
+    if isinstance(value, dict) and "allowed" in value:
+        allowed = value.get("allowed")
+        if isinstance(allowed, list):
+            for item in allowed:
+                if item != "...":
+                    return item
+            return allowed[0] if allowed else None
+    return value
+
+
+def _build_upperbound_selection_from_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    selection: Dict[str, Any] = {}
+    generator = config.get("generator")
+    if not isinstance(generator, dict):
+        generator = (config.get("rag_search_space") or {}).get("generator")
+    if isinstance(generator, dict):
+        model_url = _pick_first(generator.get("model_url"))
+        model_name = _pick_first(generator.get("model_name"))
+        api_key = _pick_first(generator.get("api_key"))
+        if model_url:
+            selection["generator"] = {"model_url": str(model_url)}
+            if model_name:
+                selection["generator"]["model_name"] = str(model_name)
+            if api_key:
+                selection["generator"]["api_key"] = str(api_key)
+
+    eval_metrics = config.get("eval_metrics")
+    if isinstance(eval_metrics, dict):
+        selection["eval_metrics"] = eval_metrics
+    return selection
+
+
+def _extract_upperbound_contexts(
+    qa_items: List[Dict[str, Any]], corpus_items: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    corpus_by_id: Dict[str, Dict[str, Any]] = {}
+    corpus_ids: List[str] = []
+    for item in corpus_items:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id") or item.get("qid") or item.get("doc_id")
+        content = item.get("content")
+        image_path = item.get("image_path") or item.get("image")
+        if item_id is None or content is None:
+            continue
+        item_id_str = str(item_id)
+        corpus_by_id[item_id_str] = {
+            "content": str(content),
+            "image_paths": [] if image_path is None else [str(image_path)],
+        }
+        corpus_ids.append(item_id_str)
+
+    contexts: List[Dict[str, Any]] = []
+    for idx, qa in enumerate(qa_items):
+        if not isinstance(qa, dict):
+            contexts.append({"content": "", "image_paths": []})
+            continue
+        qa_id = qa.get("id") or qa.get("qid") or qa.get("doc_id")
+        if qa_id is not None:
+            qa_id_str = str(qa_id)
+            exact = corpus_by_id.get(qa_id_str)
+            if exact is not None:
+                contexts.append(dict(exact))
+                continue
+            matched_items = [
+                corpus_by_id[cid]
+                for cid in corpus_ids
+                if cid == qa_id_str or cid.startswith(f"{qa_id_str}_")
+            ]
+            if matched_items:
+                image_paths: List[str] = []
+                for item in matched_items:
+                    image_paths.extend(item.get("image_paths") or [])
+                contexts.append(
+                    {
+                        "content": "\n".join([item["content"] for item in matched_items]),
+                        "image_paths": image_paths,
+                    }
+                )
+                continue
+        if idx < len(corpus_items):
+            item = corpus_items[idx]
+            contexts.append(
+                {
+                    "content": str(item.get("content", "")),
+                    "image_paths": [
+                        str(path)
+                        for path in [item.get("image_path") or item.get("image")]
+                        if path
+                    ],
+                }
+            )
+        else:
+            contexts.append({"content": "", "image_paths": []})
+    return contexts
 
 
 def run_clip_stage(data_json_path: str, selection_path: str) -> Dict[str, Any]:
@@ -362,21 +467,48 @@ async def run_pipeline_async(
     selection_path: str,
     collection: Any,
     clip_index: Dict[str, Any] | None,
+    idx: Optional[int] = None,
 ) -> Dict[str, Any]:
+    debug = os.getenv("MM_DEBUG") == "1"
+    qtag = f"qid{idx}" if idx is not None else "qid-"
+    if debug:
+        t0 = time.perf_counter()
     rewritten = await run_rewriter_stage_async(query, selection_path)
-    retrieval = await run_retriever_stage_async(
-        rewritten, selection_path, collection
-    )
+    if debug:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"[multimodal][debug] {qtag} rewrite done ({elapsed_ms:.1f} ms)", flush=True)
+        t0 = time.perf_counter()
+    retrieval = await run_retriever_stage_async(rewritten, selection_path, collection)
+    if debug:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"[multimodal][debug] {qtag} retrieve done ({elapsed_ms:.1f} ms)", flush=True)
+        t0 = time.perf_counter()
     image_retrieval = await run_multimodal_retriever_stage_async(
         rewritten, selection_path, clip_index
     )
+    if debug:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(
+            f"[multimodal][debug] {qtag} image_retrieve done ({elapsed_ms:.1f} ms)",
+            flush=True,
+        )
     _debug(f"image_retrieval={len(image_retrieval)}")
+    if debug:
+        t0 = time.perf_counter()
     reranked = await run_reranker_stage_async(rewritten, selection_path, retrieval)
+    if debug:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"[multimodal][debug] {qtag} rerank done ({elapsed_ms:.1f} ms)", flush=True)
     pruned_text = _join_candidates(reranked)
     image_paths = _extract_image_paths(image_retrieval)
+    if debug:
+        t0 = time.perf_counter()
     answer = await run_generator_stage_async(
         query, selection_path, pruned_text, images=image_paths
     )
+    if debug:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"[multimodal][debug] {qtag} generate done ({elapsed_ms:.1f} ms)", flush=True)
     return {
         "query": query,
         "rewritten": rewritten,
@@ -421,34 +553,42 @@ async def run_batch_async(
         f"num_images={(clip_index or {}).get('num_images')}"
     )
 
-    async def _run_one(q: str) -> Dict[str, Any]:
+    async def _run_one(idx: int, q: str) -> Dict[str, Any]:
         async with semaphore:
-            return await run_pipeline_async(q, selection_path, collection, clip_index)
+            result_item = await run_pipeline_async(q, selection_path, collection, clip_index, idx=idx)
+            return {"_index": idx, **result_item}
 
     selection = _load_yaml(selection_path)
     eval_cfg = selection.get("eval_metrics")
     total = len(queries)
-    tasks = [asyncio.create_task(_run_one(q)) for q in queries]
-    outputs: List[Dict[str, Any]] = []
+    tasks = [asyncio.create_task(_run_one(idx, q)) for idx, q in enumerate(queries)]
+    outputs: List[Optional[Dict[str, Any]]] = [None] * total
     if tqdm is not None:
         with tqdm(total=total, desc="progress", unit="qa") as bar:
             for coro in asyncio.as_completed(tasks):
                 result_item = await coro
-                outputs.append(result_item)
+                idx = result_item.get("_index")
+                if isinstance(idx, int) and 0 <= idx < total:
+                    outputs[idx] = {k: v for k, v in result_item.items() if k != "_index"}
+                else:
+                    outputs.append({k: v for k, v in result_item.items() if k != "_index"})
                 bar.update(1)
     else:
         completed = 0
         for coro in asyncio.as_completed(tasks):
             result_item = await coro
-            outputs.append(result_item)
+            idx = result_item.get("_index")
+            if isinstance(idx, int) and 0 <= idx < total:
+                outputs[idx] = {k: v for k, v in result_item.items() if k != "_index"}
+            else:
+                outputs.append({k: v for k, v in result_item.items() if k != "_index"})
             completed += 1
             print(f"\rprogress: {completed}/{total}", end="", flush=True)
         if total > 0:
             print()
     try:
-        preds = (
-            answers_list if answers_list is not None else [o.get("answer", "") for o in outputs]
-        )
+        outputs_clean = [o or {} for o in outputs]
+        preds = answers_list if answers_list is not None else [o.get("answer", "") for o in outputs_clean]
         report = evaluate_report(
             preds=preds,
             refs_list=references_list or [],
@@ -458,7 +598,7 @@ async def run_batch_async(
         )
         return {
             "debug_dump": result.get("debug_dump"),
-            "outputs": outputs,
+            "outputs": outputs_clean,
             "report": report,
             "clip_index": clip_index,
         }
@@ -475,12 +615,122 @@ async def run_batch_async(
                 clip_client.delete_collection(name=clip_collection_name)
             except Exception:
                 pass
+        clear_eval_cache()
+        clear_reranker_cache()
         if torch and torch.cuda.is_available():
             try:
                 torch.cuda.empty_cache()
             except Exception:
                 pass
         gc.collect()
+
+
+async def getupperbound_external_async(
+    qa_json_path: str,
+    corpus_json_path: str,
+    config_path: str,
+    eval_mode: str = "both",
+) -> Dict[str, Any]:
+    config = _load_yaml(config_path)
+    selection = _build_upperbound_selection_from_config(config)
+    fd, selection_path = tempfile.mkstemp(prefix="upperbound_mm_", suffix=".yaml")
+    os.close(fd)
+    with open(selection_path, "w", encoding="utf-8") as handle:
+        yaml.safe_dump(selection, handle, sort_keys=False, allow_unicode=True)
+    try:
+        qa_items = _load_json(qa_json_path)
+        corpus_items = _load_json(corpus_json_path)
+        contexts = _extract_upperbound_contexts(qa_items, corpus_items)
+
+        queries: List[str] = []
+        references_list: List[List[str]] = []
+        for item in qa_items:
+            query = item.get("query") or item.get("question")
+            queries.append("" if query is None else str(query))
+            refs = item.get("references") or item.get("answers") or item.get("reference")
+            if refs is None:
+                references_list.append([])
+            elif isinstance(refs, list):
+                references_list.append([str(r) for r in refs])
+            else:
+                references_list.append([str(refs)])
+
+        config_pipeline = _load_pipeline_config()
+        max_tasks = int(config_pipeline.get("concurrency", {}).get("max_tasks", 8))
+        semaphore = asyncio.Semaphore(max_tasks)
+
+        async def _run_one(idx: int, q: str, ctx: Dict[str, Any]) -> Dict[str, Any]:
+            async with semaphore:
+                images = [str(p) for p in (ctx.get("image_paths") or []) if p]
+                answer = await run_generator_stage_async(
+                    q, selection_path, ctx.get("content", ""), images=images
+                )
+                return {
+                    "_index": idx,
+                    "query": q,
+                    "context": ctx.get("content", ""),
+                    "image_paths": images,
+                    "answer": answer,
+                }
+
+        tasks = [
+            asyncio.create_task(_run_one(idx, q, ctx))
+            for idx, (q, ctx) in enumerate(zip(queries, contexts))
+        ]
+        outputs: List[Optional[Dict[str, Any]]] = [None] * len(tasks)
+        total = len(tasks)
+        if tqdm is not None:
+            with tqdm(total=total, desc="upperbound", unit="qa") as bar:
+                for coro in asyncio.as_completed(tasks):
+                    result_item = await coro
+                    idx = result_item.get("_index")
+                    if isinstance(idx, int) and 0 <= idx < total:
+                        outputs[idx] = {k: v for k, v in result_item.items() if k != "_index"}
+                    else:
+                        outputs.append({k: v for k, v in result_item.items() if k != "_index"})
+                    bar.update(1)
+        else:
+            completed = 0
+            for coro in asyncio.as_completed(tasks):
+                result_item = await coro
+                idx = result_item.get("_index")
+                if isinstance(idx, int) and 0 <= idx < total:
+                    outputs[idx] = {k: v for k, v in result_item.items() if k != "_index"}
+                else:
+                    outputs.append({k: v for k, v in result_item.items() if k != "_index"})
+                completed += 1
+                print(f"\rprogress: {completed}/{total}", end="", flush=True)
+            if total > 0:
+                print()
+
+        eval_cfg = selection.get("eval_metrics")
+        outputs_clean = [o or {} for o in outputs]
+        report = evaluate_report(
+            preds=[o.get("answer", "") for o in outputs_clean],
+            refs_list=references_list,
+            queries=queries,
+            mode=eval_mode,
+            eval_cfg=eval_cfg,
+        )
+        return {"outputs": outputs_clean, "report": report}
+    finally:
+        os.remove(selection_path)
+
+
+def getupperbound_external(
+    qa_json_path: str,
+    corpus_json_path: str,
+    config_path: str,
+    eval_mode: str = "both",
+) -> Dict[str, Any]:
+    return asyncio.run(
+        getupperbound_external_async(
+            qa_json_path=qa_json_path,
+            corpus_json_path=corpus_json_path,
+            config_path=config_path,
+            eval_mode=eval_mode,
+        )
+    )
 
 
 def main() -> None:

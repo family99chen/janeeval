@@ -4,8 +4,9 @@ import os
 import sys
 import uuid
 import gc
+import time
 import tempfile
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import yaml
 
@@ -23,17 +24,21 @@ try:
     from rag.normal.models.chunking import build_chroma_db, build_chroma_db_async
     from rag.normal.models.retriever import retrieve, retrieve_async
     from rag.normal.models.pruner import prune_chunks, prune_chunks_async
-    from rag.normal.models.reranker import rerank, rerank_async
+    from rag.normal.models.reranker import (
+        rerank,
+        rerank_async,
+        clear_reranker_cache,
+    )
     from rag.normal.models.generator import generate_answer, generate_answer_async
-    from rag.normal.models.eval import evaluate_report
+    from rag.normal.models.eval import evaluate_report, clear_eval_cache
 except ModuleNotFoundError:
     from models.rewriter import rewrite_query, rewrite_query_async
     from models.chunking import build_chroma_db, build_chroma_db_async
     from models.retriever import retrieve, retrieve_async
     from models.pruner import prune_chunks, prune_chunks_async
-    from models.reranker import rerank, rerank_async
+    from models.reranker import rerank, rerank_async, clear_reranker_cache
     from models.generator import generate_answer, generate_answer_async
-    from models.eval import evaluate_report
+    from models.eval import evaluate_report, clear_eval_cache
 
 try:
     import torch
@@ -379,14 +384,35 @@ async def run_pipeline_async(
     query: str,
     selection_path: str,
     collection: Any,
+    idx: Optional[int] = None,
 ) -> Dict[str, Any]:
+    debug = os.getenv("PIPELINE_DEBUG") == "1"
+    qtag = f"qid{idx}" if idx is not None else "qid-"
+    t0 = time.perf_counter()
     rewritten = await run_rewriter_stage_async(query, selection_path)
-    retrieval = await run_retriever_stage_async(
-        rewritten, selection_path, collection
-    )
+    if debug:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"[pipeline][debug] {qtag} rewrite done ({elapsed_ms:.1f} ms)", flush=True)
+    t0 = time.perf_counter()
+    retrieval = await run_retriever_stage_async(rewritten, selection_path, collection)
+    if debug:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"[pipeline][debug] {qtag} retrieve done ({elapsed_ms:.1f} ms)", flush=True)
+    t0 = time.perf_counter()
     reranked = await run_reranker_stage_async(rewritten, selection_path, retrieval)
+    if debug:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"[pipeline][debug] {qtag} rerank done ({elapsed_ms:.1f} ms)", flush=True)
+    t0 = time.perf_counter()
     pruned_text = await run_pruner_stage_async(rewritten, selection_path, reranked)
+    if debug:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"[pipeline][debug] {qtag} prune done ({elapsed_ms:.1f} ms)", flush=True)
+    t0 = time.perf_counter()
     answer = await run_generator_stage_async(query, selection_path, pruned_text)
+    if debug:
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        print(f"[pipeline][debug] {qtag} generate done ({elapsed_ms:.1f} ms)", flush=True)
     return {
         "query": query,
         "rewritten": rewritten,
@@ -417,34 +443,42 @@ async def run_batch_async(
     max_tasks = int(config.get("concurrency", {}).get("max_tasks", 8))
     semaphore = asyncio.Semaphore(max_tasks)
 
-    async def _run_one(q: str) -> Dict[str, Any]:
+    async def _run_one(idx: int, q: str) -> Dict[str, Any]:
         async with semaphore:
-            return await run_pipeline_async(q, selection_path, collection)
+            result_item = await run_pipeline_async(q, selection_path, collection, idx=idx)
+            return {"_index": idx, **result_item}
 
     selection = _load_yaml(selection_path)
     eval_cfg = selection.get("eval_metrics")
     total = len(queries)
-    tasks = [asyncio.create_task(_run_one(q)) for q in queries]
-    outputs: List[Dict[str, Any]] = []
+    tasks = [asyncio.create_task(_run_one(idx, q)) for idx, q in enumerate(queries)]
+    outputs: List[Optional[Dict[str, Any]]] = [None] * total
     if tqdm is not None:
         with tqdm(total=total, desc="progress", unit="qa") as bar:
             for coro in asyncio.as_completed(tasks):
                 result_item = await coro
-                outputs.append(result_item)
+                idx = result_item.get("_index")
+                if isinstance(idx, int) and 0 <= idx < total:
+                    outputs[idx] = {k: v for k, v in result_item.items() if k != "_index"}
+                else:
+                    outputs.append({k: v for k, v in result_item.items() if k != "_index"})
                 bar.update(1)
     else:
         completed = 0
         for coro in asyncio.as_completed(tasks):
             result_item = await coro
-            outputs.append(result_item)
+            idx = result_item.get("_index")
+            if isinstance(idx, int) and 0 <= idx < total:
+                outputs[idx] = {k: v for k, v in result_item.items() if k != "_index"}
+            else:
+                outputs.append({k: v for k, v in result_item.items() if k != "_index"})
             completed += 1
             print(f"\rprogress: {completed}/{total}", end="", flush=True)
         if total > 0:
             print()
     try:
-        preds = (
-            answers_list if answers_list is not None else [o.get("answer", "") for o in outputs]
-        )
+        outputs_clean = [o or {} for o in outputs]
+        preds = answers_list if answers_list is not None else [o.get("answer", "") for o in outputs_clean]
         report = evaluate_report(
             preds=preds,
             refs_list=references_list or [],
@@ -454,7 +488,7 @@ async def run_batch_async(
         )
         return {
             "debug_dump": result.get("debug_dump"),
-            "outputs": outputs,
+            "outputs": outputs_clean,
             "report": report,
         }
     finally:
@@ -463,6 +497,8 @@ async def run_batch_async(
                 client.delete_collection(name=collection_name)
             except Exception:
                 pass
+        clear_eval_cache()
+        clear_reranker_cache()
         if torch and torch.cuda.is_available():
             try:
                 torch.cuda.empty_cache()
@@ -505,42 +541,51 @@ async def getupperbound_external_async(
         max_tasks = int(config_pipeline.get("concurrency", {}).get("max_tasks", 8))
         semaphore = asyncio.Semaphore(max_tasks)
 
-        async def _run_one(q: str, ctx: str) -> Dict[str, Any]:
+        async def _run_one(idx: int, q: str, ctx: str) -> Dict[str, Any]:
             async with semaphore:
                 answer = await run_generator_stage_async(q, selection_path, ctx)
-                return {"query": q, "context": ctx, "answer": answer}
+                return {"_index": idx, "query": q, "context": ctx, "answer": answer}
 
         tasks = [
-            asyncio.create_task(_run_one(q, ctx))
-            for q, ctx in zip(queries, contexts)
+            asyncio.create_task(_run_one(idx, q, ctx))
+            for idx, (q, ctx) in enumerate(zip(queries, contexts))
         ]
-        outputs: List[Dict[str, Any]] = []
+        outputs: List[Optional[Dict[str, Any]]] = [None] * len(tasks)
         total = len(tasks)
         if tqdm is not None:
             with tqdm(total=total, desc="upperbound", unit="qa") as bar:
                 for coro in asyncio.as_completed(tasks):
                     result_item = await coro
-                    outputs.append(result_item)
+                    idx = result_item.get("_index")
+                    if isinstance(idx, int) and 0 <= idx < total:
+                        outputs[idx] = {k: v for k, v in result_item.items() if k != "_index"}
+                    else:
+                        outputs.append({k: v for k, v in result_item.items() if k != "_index"})
                     bar.update(1)
         else:
             completed = 0
             for coro in asyncio.as_completed(tasks):
                 result_item = await coro
-                outputs.append(result_item)
+                idx = result_item.get("_index")
+                if isinstance(idx, int) and 0 <= idx < total:
+                    outputs[idx] = {k: v for k, v in result_item.items() if k != "_index"}
+                else:
+                    outputs.append({k: v for k, v in result_item.items() if k != "_index"})
                 completed += 1
                 print(f"\rprogress: {completed}/{total}", end="", flush=True)
             if total > 0:
                 print()
 
         eval_cfg = selection.get("eval_metrics")
+        outputs_clean = [o or {} for o in outputs]
         report = evaluate_report(
-            preds=[o.get("answer", "") for o in outputs],
+            preds=[o.get("answer", "") for o in outputs_clean],
             refs_list=references_list,
             queries=queries,
             mode=eval_mode,
             eval_cfg=eval_cfg,
         )
-        return {"outputs": outputs, "report": report}
+        return {"outputs": outputs_clean, "report": report}
     finally:
         os.remove(selection_path)
 

@@ -10,6 +10,9 @@ if project_root not in sys.path:
 
 from functions.checkconfig import check_config, check_config_multimodal
 from rag.normal.pipeline import getupperbound_external as getupperbound_external_pipeline
+from rag.multimodal.pipeline import (
+    getupperbound_external as getupperbound_external_multimodal,
+)
 from rag.normal.pipeline import run_batch_async
 from rag.multimodal.pipeline import run_batch_async as run_batch_async_multimodal
 
@@ -111,23 +114,40 @@ def evaluate_rag_multimodal(
     }
 
 # you can use if you want, but may exceed the actual upperbound that config really can access
-#def theoretical_getupperbound(
-#    qa_json_path: str,
-#    corpus_json_path: str,
-#    eval_mode: str = "both",
-#) -> Dict[str, Any]:
-#    base_dir = os.path.abspath(os.path.dirname(__file__))
-#    config_path = os.path.join(base_dir, "algorithms", "configforalgo.yaml")
-#    result = getupperbound_external_pipeline(
-#        qa_json_path=qa_json_path,
-#        corpus_json_path=corpus_json_path,
-#        config_path=config_path,
-#        eval_mode=eval_mode,
-#    )
-#    return {
-#        "eval_report": result.get("report"),
-#        "outputs": result.get("outputs"),
-#    }
+def theoretical_getupperbound(
+    qa_json_path: str,
+    corpus_json_path: str,
+    config_path: str,
+    eval_mode: str = "both",
+) -> Dict[str, Any]:
+    result = getupperbound_external_pipeline(
+        qa_json_path=qa_json_path,
+        corpus_json_path=corpus_json_path,
+        config_path=config_path,
+        eval_mode=eval_mode,
+    )
+    return {
+        "eval_report": result.get("report"),
+        "outputs": result.get("outputs"),
+    }
+
+
+def theoretical_getupperbound_multimodal(
+    qa_json_path: str,
+    corpus_json_path: str,
+    config_path: str,
+    eval_mode: str = "both",
+) -> Dict[str, Any]:
+    result = getupperbound_external_multimodal(
+        qa_json_path=qa_json_path,
+        corpus_json_path=corpus_json_path,
+        config_path=config_path,
+        eval_mode=eval_mode,
+    )
+    return {
+        "eval_report": result.get("report"),
+        "outputs": result.get("outputs"),
+    }
 
 
 def main() -> None:
@@ -168,6 +188,8 @@ def main() -> None:
                     "index": idx,
                     "image_count": image_count,
                     "answer": output.get("answer", ""),
+                    "references": scores.get("references") or [],
+                    "llmaaj_reason": scores.get("LLMAAJ_reason") or "",
                     "score": scores,
                 }
             )
@@ -180,6 +202,25 @@ def main() -> None:
         result = evaluate_rag(
             qa_json_path, corpus_json_path, config_path, eval_mode=eval_mode
         )
+        outputs = result.get("outputs") or []
+        report = result.get("eval_report") or {}
+        per_item = report.get("per_item") or []
+        item_count = min(len(outputs), len(per_item)) if per_item else len(outputs)
+        item_summaries: List[Dict[str, Any]] = []
+        for idx in range(item_count):
+            output = outputs[idx] if idx < len(outputs) else {}
+            scores = per_item[idx] if idx < len(per_item) else {}
+            item_summaries.append(
+                {
+                    "index": idx,
+                    "answer": output.get("answer", ""),
+                    "references": scores.get("references") or [],
+                    "llmaaj_reason": scores.get("LLMAAJ_reason") or "",
+                    "score": scores,
+                }
+            )
+        if item_summaries:
+            print(json.dumps(item_summaries, ensure_ascii=False, indent=2))
     metrics = (result.get("eval_report") or {}).get("metrics") or {}
     print(json.dumps(metrics, ensure_ascii=False, indent=2))
 

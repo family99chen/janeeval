@@ -39,16 +39,30 @@ def _normalize_contexts(raw: Any) -> List[str]:
 def _build_outputs(
     items: List[Dict[str, Any]],
     sample_size: int | None,
+    corpus_size: int | None,
     seed: int,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     qa: List[Dict[str, Any]] = []
     corpus: List[Dict[str, Any]] = []
 
+    rng = random.Random(seed)
+    qa_items = items
     if sample_size is not None and sample_size > 0 and sample_size < len(items):
-        random.seed(seed)
-        items = random.sample(items, sample_size)
+        qa_items = rng.sample(items, sample_size)
 
-    for idx, item in enumerate(items):
+    if corpus_size is None:
+        corpus_items = list(qa_items)
+    else:
+        if corpus_size < len(qa_items):
+            corpus_size = len(qa_items)
+        if corpus_size > len(items):
+            corpus_size = len(items)
+        remaining = [item for item in items if item not in qa_items]
+        extra_needed = max(corpus_size - len(qa_items), 0)
+        extra_items = rng.sample(remaining, min(extra_needed, len(remaining)))
+        corpus_items = list(qa_items) + extra_items
+
+    for idx, item in enumerate(qa_items):
         qid = item.get("_id") or item.get("id") or item.get("qid") or str(idx)
         query = item.get("input") or item.get("question")
         contexts = _normalize_contexts(item.get("context"))
@@ -66,6 +80,11 @@ def _build_outputs(
 
         qa.append({"id": str(qid), "query": str(query), "references": references})
 
+    for idx, item in enumerate(corpus_items):
+        qid = item.get("_id") or item.get("id") or item.get("qid") or str(idx)
+        contexts = _normalize_contexts(item.get("context"))
+        if not contexts:
+            continue
         if len(contexts) == 1:
             corpus.append({"id": str(qid), "content": contexts[0]})
         else:
@@ -78,7 +97,8 @@ def _build_outputs(
 def main() -> None:
     if len(sys.argv) < 4:
         print(
-            "Usage: python qa_transfer.py <input.jsonl> <qa_out.json> <corpus_out.json> [sample_size] [seed]"
+            "Usage: python qa_transfer.py <input.jsonl> <qa_out.json> <corpus_out.json> "
+            "[sample_size] [corpus_size] [seed]"
         )
         sys.exit(1)
 
@@ -86,10 +106,19 @@ def main() -> None:
     qa_out = sys.argv[2]
     corpus_out = sys.argv[3]
     sample_size = int(sys.argv[4]) if len(sys.argv) > 4 else None
-    seed = int(sys.argv[5]) if len(sys.argv) > 5 else 42
+    corpus_size = None
+    seed = 42
+    if len(sys.argv) > 5:
+        if len(sys.argv) == 6:
+            seed = int(sys.argv[5])
+        else:
+            corpus_size = int(sys.argv[5])
+            seed = int(sys.argv[6]) if len(sys.argv) > 6 else 42
 
     items = _read_jsonl(input_path)
-    qa, corpus = _build_outputs(items, sample_size=sample_size, seed=seed)
+    qa, corpus = _build_outputs(
+        items, sample_size=sample_size, corpus_size=corpus_size, seed=seed
+    )
 
     with open(qa_out, "w", encoding="utf-8") as handle:
         json.dump(qa, handle, ensure_ascii=False, indent=2)

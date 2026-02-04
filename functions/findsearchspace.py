@@ -97,7 +97,7 @@ def _build_description(is_multimodal: bool) -> List[str]:
         "This endpoint lists all searchable RAG hyperparameters.",
         "All selectable values are constrained to the 'allowed' lists in config.yaml.",
         "Model URL can be provided at runtime.",
-        "Model name and API key are optional and only required when using an API.",
+        "Model name and API key are optional and only required when using an API. Change to local mode automatically if api key and model name are not provided.",
         "Prompt templates must be chosen by ID and map to the fixed templates below.",
         "Evaluation resources can be provided under eval_metrics.llmaaj and eval_metrics.bert.",
         "Use the template below to create a selection YAML file.",

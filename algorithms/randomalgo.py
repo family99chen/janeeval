@@ -10,6 +10,13 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+if os.getenv("PIPELINE_DEBUG") == "1" or os.getenv("EVAL_DEBUG") == "1":
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
 from mainfunction import evaluate_rag, evaluate_rag_multimodal
 
 try:
@@ -39,8 +46,12 @@ def _dump_yaml(data: Dict[str, Any], path: str) -> None:
 
 
 def _allowed_values(node: Any) -> List[Any]:
-    if not isinstance(node, dict):
+    if node is None:
         return []
+    if isinstance(node, list):
+        return node
+    if not isinstance(node, dict):
+        return [node]
     allowed = node.get("allowed")
     if not isinstance(allowed, list):
         return []
@@ -144,8 +155,39 @@ def _score_from_report(
     return "LLMAAJ", 0.0
 
 
-def _is_multimodal(algo_cfg: Dict[str, Any]) -> bool:
-    return isinstance(algo_cfg, dict) and isinstance(algo_cfg.get("clip"), dict)
+def _sanitize_selection(selection: Dict[str, Any]) -> None:
+    chunking = selection.get("chunking")
+    if isinstance(chunking, dict):
+        chunking.pop("model_url", None)
+        chunking.pop("model_name", None)
+        if chunking.get("model_url") is None:
+            chunking.pop("model_url", None)
+        if chunking.get("model_name") is None:
+            chunking.pop("model_name", None)
+
+
+def _split_config(config: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
+    search_space = config.get("rag_search_space") or {}
+    eval_metrics = config.get("eval_metrics")
+    algo_cfg = {
+        key: value
+        for key, value in config.items()
+        if key not in {"rag_search_space", "eval_metrics"}
+    }
+    return search_space, algo_cfg, eval_metrics
+
+
+def _is_multimodal(search_space: Dict[str, Any], algo_cfg: Dict[str, Any]) -> bool:
+    if isinstance(search_space, dict) and "clip" in search_space:
+        return True
+    return isinstance(algo_cfg, dict) and "clip" in algo_cfg
+
+
+def _set_eval_schema_env(config_path: str, use_multimodal: bool) -> None:
+    if use_multimodal:
+        os.environ["RAGSEARCH_CONFIG_MULTIMODAL"] = config_path
+    else:
+        os.environ["RAGSEARCH_CONFIG"] = config_path
 
 
 def _module_forced_on(algo_cfg: Dict[str, Any], module: str) -> bool:
@@ -161,9 +203,34 @@ def _param_choices(value: Any, override: Optional[List[Any]]) -> List[Any]:
     allowed = _allowed_values(value)
     if allowed:
         return allowed
+    if value is None:
+        return []
     if isinstance(value, dict):
         return []
     return [value]
+
+
+def _paired_model_choices(
+    params: Dict[str, Any], algo_cfg: Dict[str, Any], module: str
+) -> Optional[List[Dict[str, Any]]]:
+    if not isinstance(params, dict):
+        return None
+    url_override = _override_choices(module, "model_url", algo_cfg)
+    name_override = _override_choices(module, "model_name", algo_cfg)
+    url_choices = _param_choices(params.get("model_url"), url_override)
+    name_choices = _param_choices(params.get("model_name"), name_override)
+    if not url_choices or not name_choices:
+        return None
+    if any(choice is None for choice in url_choices) or any(
+        choice is None for choice in name_choices
+    ):
+        return None
+    if len(url_choices) != len(name_choices):
+        return None
+    return [
+        {"model_url": url, "model_name": name}
+        for url, name in zip(url_choices, name_choices)
+    ]
 
 
 def _build_module_variants(
@@ -173,9 +240,12 @@ def _build_module_variants(
     is_optional: bool,
 ) -> List[Optional[Dict[str, Any]]]:
     forced_on = _module_forced_on(algo_cfg, module)
+    pair_choices = _paired_model_choices(params, algo_cfg, module)
     keys: List[str] = []
     choices_list: List[List[Any]] = []
     for key, value in params.items():
+        if pair_choices and key in {"model_url", "model_name"}:
+            continue
         override = _override_choices(module, key, algo_cfg)
         choices = _param_choices(value, override)
         if not choices:
@@ -184,20 +254,23 @@ def _build_module_variants(
         choices_list.append(choices)
 
     variants: List[Dict[str, Any]] = []
-    if not keys:
-        variants.append({})
-    else:
-        def _build(idx: int, current: Dict[str, Any]) -> None:
-            if idx == len(keys):
-                variants.append(dict(current))
-                return
-            key = keys[idx]
-            for choice in choices_list[idx]:
-                current[key] = choice
-                _build(idx + 1, current)
-            current.pop(key, None)
+    pair_list = pair_choices or [None]
+    for pair in pair_list:
+        current: Dict[str, Any] = dict(pair) if pair else {}
+        if not keys:
+            variants.append(dict(current))
+        else:
+            def _build(idx: int, current_map: Dict[str, Any]) -> None:
+                if idx == len(keys):
+                    variants.append(dict(current_map))
+                    return
+                key = keys[idx]
+                for choice in choices_list[idx]:
+                    current_map[key] = choice
+                    _build(idx + 1, current_map)
+                current_map.pop(key, None)
 
-        _build(0, {})
+            _build(0, current)
 
     if is_optional and not forced_on:
         return [None] + variants
@@ -235,6 +308,7 @@ def _evaluate_selection(
     score_weights: Optional[Dict[str, float]],
     eval_fn,
 ) -> Tuple[float, Dict[str, Any]]:
+    _sanitize_selection(selection)
     selection_path = _write_temp_selection(selection)
     try:
         result = eval_fn(
@@ -290,28 +364,21 @@ def _selection_key(selection: Dict[str, Any]) -> str:
 def random_search(
     qa_json_path: str,
     corpus_json_path: str,
-    template_path: str,
-    algo_config_path: str,
+    config_path: str,
     eval_mode: str,
     report_path: str,
     samples: int,
     seed: int,
     score_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
-    template = _load_yaml(template_path)
-    search_space = template.get("rag_search_space") or {}
-    eval_metrics = template.get("eval_metrics")
-    algo_cfg = _load_yaml(algo_config_path)
+    config = _load_yaml(config_path)
+    search_space, algo_cfg, eval_metrics = _split_config(config)
     preferred_metric = None
     if isinstance(algo_cfg, dict):
         preferred_metric = algo_cfg.get("score_metric") or algo_cfg.get("metric")
-    use_multimodal = _is_multimodal(algo_cfg)
+    use_multimodal = _is_multimodal(search_space, algo_cfg)
+    _set_eval_schema_env(config_path, use_multimodal)
     eval_fn = evaluate_rag_multimodal if use_multimodal else evaluate_rag
-    if use_multimodal and template_path.endswith("config.yaml"):
-        template_path = os.path.join(os.path.dirname(template_path), "config_multimodal.yaml")
-        template = _load_yaml(template_path)
-        search_space = template.get("rag_search_space") or {}
-        eval_metrics = template.get("eval_metrics")
     rng = random.Random(seed)
     trials: List[Dict[str, Any]] = []
     best_score: float = float("-inf")
@@ -367,6 +434,7 @@ def random_search(
             json.dump(snapshot, handle, ensure_ascii=False, indent=2)
 
     for idx, candidate in enumerate(all_configs):
+        _sanitize_selection(candidate)
         print(f"\n[random] trial={idx+1} selection={json.dumps(candidate, ensure_ascii=False)}")
         score, payload = _evaluate_selection(
             qa_json_path,
@@ -411,7 +479,6 @@ def main() -> None:
     import argparse
 
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    default_template = os.path.join(base_dir, "config.yaml")
     default_algo_config = os.path.join(os.path.dirname(__file__), "configforalgo.yaml")
     default_report = os.path.join(base_dir, "outputs", "random_report.json")
 
@@ -420,8 +487,8 @@ def main() -> None:
     parser.add_argument("--corpus_json", required=True, help="Path to corpus JSON.")
     parser.add_argument(
         "--config_yaml",
-        default=default_template,
-        help="Path to config search space template.",
+        default=default_algo_config,
+        help="Path to algo config with search space.",
     )
     parser.add_argument(
         "--eval_mode",
@@ -433,11 +500,6 @@ def main() -> None:
         "--report_path",
         default=default_report,
         help="Path to write random search report JSON.",
-    )
-    parser.add_argument(
-        "--algo_config_yaml",
-        default=default_algo_config,
-        help="Path to algo config with real model URLs/keys.",
     )
     parser.add_argument(
         "--samples",
@@ -462,8 +524,7 @@ def main() -> None:
     random_search(
         qa_json_path=args.qa_json,
         corpus_json_path=args.corpus_json,
-        template_path=args.config_yaml,
-        algo_config_path=args.algo_config_yaml,
+        config_path=args.config_yaml,
         eval_mode=args.eval_mode,
         report_path=args.report_path,
         samples=args.samples,

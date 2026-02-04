@@ -9,6 +9,13 @@ project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
+if os.getenv("PIPELINE_DEBUG") == "1" or os.getenv("EVAL_DEBUG") == "1":
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
 from rag.normal.pipeline import run_batch_async
 from rag.multimodal.pipeline import run_batch_async as run_batch_async_multimodal
 
@@ -49,12 +56,27 @@ def _load_json(path: str) -> List[Dict[str, Any]]:
 
 
 def _allowed_values(node: Any) -> List[Any]:
-    if not isinstance(node, dict):
+    if node is None:
         return []
+    if isinstance(node, list):
+        return node
+    if not isinstance(node, dict):
+        return [node]
     allowed = node.get("allowed")
     if not isinstance(allowed, list):
         return []
     return [v for v in allowed if v != "..."]
+
+
+def _split_config(config: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
+    search_space = config.get("rag_search_space") or {}
+    eval_metrics = config.get("eval_metrics")
+    algo_cfg = {
+        key: value
+        for key, value in config.items()
+        if key not in {"rag_search_space", "eval_metrics"}
+    }
+    return search_space, algo_cfg, eval_metrics
 
 
 def _max_allowed(allowed: List[Any]) -> Optional[Any]:
@@ -65,6 +87,53 @@ def _max_allowed(allowed: List[Any]) -> Optional[Any]:
         return max(numeric)
     return allowed[-1]
 
+
+def _choice_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return _allowed_values(value)
+    return [value]
+
+
+def _pick_first_value(value: Any) -> Any:
+    choices = _choice_list(value)
+    return choices[0] if choices else None
+
+
+def _pick_param(
+    params: Dict[str, Any], algo_cfg: Dict[str, Any], module: str, key: str
+) -> Any:
+    if isinstance(algo_cfg, dict):
+        section = algo_cfg.get(module)
+        if isinstance(section, dict) and key in section:
+            return _pick_first_value(section.get(key))
+    if isinstance(params, dict) and key in params:
+        return _pick_first_value(params.get(key))
+    return None
+
+
+def _pick_paired_model(
+    params: Dict[str, Any], algo_cfg: Dict[str, Any], module: str
+) -> Tuple[Any, Any]:
+    url_choices = None
+    name_choices = None
+    if isinstance(algo_cfg, dict):
+        section = algo_cfg.get(module)
+        if isinstance(section, dict):
+            if "model_url" in section:
+                url_choices = _choice_list(section.get("model_url"))
+            if "model_name" in section:
+                name_choices = _choice_list(section.get("model_name"))
+    if url_choices is None:
+        url_choices = _choice_list(params.get("model_url") if isinstance(params, dict) else None)
+    if name_choices is None:
+        name_choices = _choice_list(params.get("model_name") if isinstance(params, dict) else None)
+    if url_choices and name_choices and len(url_choices) == len(name_choices):
+        return url_choices[0], name_choices[0]
+    return (url_choices[0] if url_choices else None, name_choices[0] if name_choices else None)
 
 def _parse_score_weights(text: str) -> Optional[Dict[str, float]]:
     if not text:
@@ -134,6 +203,13 @@ def _score_from_report(
     return "LLMAAJ", 0.0
 
 
+def _sanitize_selection(selection: Dict[str, Any]) -> None:
+    chunking = selection.get("chunking")
+    if isinstance(chunking, dict):
+        chunking.pop("model_url", None)
+        chunking.pop("model_name", None)
+
+
 def _write_temp_selection(selection: Dict[str, Any]) -> str:
     fd, path = tempfile.mkstemp(prefix="upperbound_selection_", suffix=".yaml")
     os.close(fd)
@@ -157,9 +233,7 @@ def _build_upperbound_selection(
             }
 
     retrieve_cfg = search_space.get("retrieve", {})
-    retrieve_model_url = ((algo_cfg or {}).get("retrieve") or {}).get("model_url")
-    if isinstance(retrieve_model_url, list):
-        retrieve_model_url = retrieve_model_url[0] if retrieve_model_url else None
+    retrieve_model_url = _pick_param(retrieve_cfg, algo_cfg, "retrieve", "model_url")
     if isinstance(retrieve_cfg, dict):
         topk = _max_allowed(_allowed_values(retrieve_cfg.get("topk", {})))
         bm25 = _max_allowed(_allowed_values(retrieve_cfg.get("bm25_weight", {})))
@@ -172,24 +246,42 @@ def _build_upperbound_selection(
             if bm25 is not None:
                 selection["retrieve"]["bm25_weight"] = float(bm25)
 
-    generator_cfg = (algo_cfg or {}).get("generator")
-    if isinstance(generator_cfg, dict):
-        selection["generator"] = dict(generator_cfg)
+    pruner_search = search_space.get("pruner", {})
+    if isinstance(pruner_search, dict) or isinstance((algo_cfg or {}).get("pruner"), dict):
+        pruner_url, pruner_name = _pick_paired_model(pruner_search, algo_cfg, "pruner")
+        pruner_api_key = _pick_param(pruner_search, algo_cfg, "pruner", "api_key")
+        prompt_ids = _allowed_values(
+            pruner_search.get("prompt_template_id", {}) if isinstance(pruner_search, dict) else {}
+        )
+        if pruner_url or pruner_name or pruner_api_key or prompt_ids:
+            selection["pruner"] = {}
+            if pruner_url:
+                selection["pruner"]["model_url"] = pruner_url
+            if pruner_name:
+                selection["pruner"]["model_name"] = pruner_name
+            if pruner_api_key:
+                selection["pruner"]["api_key"] = pruner_api_key
+            if prompt_ids:
+                selection["pruner"]["prompt_template_id"] = str(prompt_ids[0])
 
-    eval_metrics = (algo_cfg or {}).get("eval_metrics")
-    if isinstance(eval_metrics, dict):
-        selection["eval_metrics"] = dict(eval_metrics)
+    generator_search = search_space.get("generator", {})
+    generator_url, generator_name = _pick_paired_model(generator_search, algo_cfg, "generator")
+    generator_api_key = _pick_param(generator_search, algo_cfg, "generator", "api_key")
+    if generator_url or generator_name or generator_api_key:
+        selection["generator"] = {}
+        if generator_url:
+            selection["generator"]["model_url"] = generator_url
+        if generator_name:
+            selection["generator"]["model_name"] = generator_name
+        if generator_api_key:
+            selection["generator"]["api_key"] = generator_api_key
 
     return selection
 
 
-def _maybe_pick_first(value: Any) -> Any:
-    if isinstance(value, list):
-        return value[0] if value else None
-    return value
-
-
-def _is_multimodal(algo_cfg: Dict[str, Any]) -> bool:
+def _is_multimodal(search_space: Dict[str, Any], algo_cfg: Dict[str, Any]) -> bool:
+    if isinstance(search_space, dict) and "clip" in search_space:
+        return True
     return isinstance(algo_cfg, dict) and "clip" in algo_cfg
 
 
@@ -198,21 +290,17 @@ def _add_clip_selection(
     search_space: Dict[str, Any],
     algo_cfg: Dict[str, Any],
 ) -> None:
-    clip_cfg = (algo_cfg or {}).get("clip")
-    if not isinstance(clip_cfg, dict):
-        return
     clip_search = search_space.get("clip", {}) if isinstance(search_space, dict) else {}
     clip_topk = _max_allowed(_allowed_values(clip_search.get("topk", {})))
-    model_url = _maybe_pick_first(clip_cfg.get("model_url"))
-    if not model_url and clip_topk is None:
+    model_url, model_name = _pick_paired_model(clip_search, algo_cfg, "clip")
+    api_key = _pick_param(clip_search, algo_cfg, "clip", "api_key")
+    if not model_url and clip_topk is None and not model_name and not api_key:
         return
     selection["clip"] = {}
     if model_url:
         selection["clip"]["model_url"] = model_url
-    model_name = _maybe_pick_first(clip_cfg.get("model_name"))
     if model_name:
         selection["clip"]["model_name"] = model_name
-    api_key = _maybe_pick_first(clip_cfg.get("api_key"))
     if api_key:
         selection["clip"]["api_key"] = api_key
     if clip_topk is not None:
@@ -247,18 +335,14 @@ def _extract_context_for_qa(
 def upperbound(
     qa_json_path: str,
     corpus_json_path: str,
-    template_path: str,
-    algo_config_path: str,
+    config_path: str,
     eval_mode: str,
     report_path: str,
     score_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
-    algo_cfg = _load_yaml(algo_config_path)
-    use_multimodal = _is_multimodal(algo_cfg)
-    if use_multimodal and template_path.endswith("config.yaml"):
-        template_path = os.path.join(os.path.dirname(template_path), "config_multimodal.yaml")
-    template = _load_yaml(template_path)
-    search_space = template.get("rag_search_space") or {}
+    config = _load_yaml(config_path)
+    search_space, algo_cfg, eval_metrics = _split_config(config)
+    use_multimodal = _is_multimodal(search_space, algo_cfg)
 
     preferred_metric = None
     if isinstance(algo_cfg, dict):
@@ -267,6 +351,9 @@ def upperbound(
     selection = _build_upperbound_selection(search_space, algo_cfg)
     if use_multimodal:
         _add_clip_selection(selection, search_space, algo_cfg)
+    if isinstance(eval_metrics, dict):
+        selection["eval_metrics"] = dict(eval_metrics)
+    _sanitize_selection(selection)
     selection_path = _write_temp_selection(selection)
 
     qa_items = _load_json(qa_json_path)
@@ -288,15 +375,21 @@ def upperbound(
     outputs: List[Dict[str, Any]] = []
     scores: List[float] = []
     metric_name = None
+    metrics_sum: Dict[str, float] = {}
+    metrics_count = 0
     report_dir = os.path.dirname(report_path)
     if report_dir:
         os.makedirs(report_dir, exist_ok=True)
 
     def _write_report_snapshot() -> None:
         avg_score = sum(scores) / len(scores) if scores else 0.0
+        metrics_avg: Dict[str, float] = {}
+        if metrics_sum and metrics_count > 0:
+            metrics_avg = {k: v / metrics_count for k, v in metrics_sum.items()}
         snapshot = {
             "upperbound_score": avg_score,
             "metric": metric_name or preferred_metric or "LLMAAJ",
+            "metrics_avg": metrics_avg,
             "selection": selection,
             "outputs": outputs,
         }
@@ -339,6 +432,14 @@ def upperbound(
                 report, preferred_metric, score_weights
             )
             scores.append(score)
+            metrics = report.get("metrics") or {}
+            if isinstance(metrics, dict) and metrics:
+                metrics_count += 1
+                for key, value in metrics.items():
+                    try:
+                        metrics_sum[key] = metrics_sum.get(key, 0.0) + float(value)
+                    except Exception:
+                        continue
             outputs.append(
                 {
                     "index": idx + 1,
@@ -358,9 +459,13 @@ def upperbound(
         os.remove(selection_path)
 
     avg_score = sum(scores) / len(scores) if scores else 0.0
+    metrics_avg: Dict[str, float] = {}
+    if metrics_sum and metrics_count > 0:
+        metrics_avg = {k: v / metrics_count for k, v in metrics_sum.items()}
     result = {
         "upperbound_score": avg_score,
         "metric": metric_name or preferred_metric or "LLMAAJ",
+        "metrics_avg": metrics_avg,
         "selection": selection,
         "outputs": outputs,
     }
@@ -374,7 +479,6 @@ def main() -> None:
     import argparse
 
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    default_template = os.path.join(base_dir, "config.yaml")
     default_algo_config = os.path.join(os.path.dirname(__file__), "configforalgo.yaml")
     default_report = os.path.join(base_dir, "outputs", "upperbound_report.json")
 
@@ -383,13 +487,8 @@ def main() -> None:
     parser.add_argument("--corpus_json", required=True, help="Path to corpus JSON.")
     parser.add_argument(
         "--config_yaml",
-        default=default_template,
-        help="Path to config search space template.",
-    )
-    parser.add_argument(
-        "--algo_config_yaml",
         default=default_algo_config,
-        help="Path to algo config with real model URLs/keys.",
+        help="Path to algo config with search space.",
     )
     parser.add_argument(
         "--eval_mode",
@@ -413,8 +512,7 @@ def main() -> None:
     upperbound(
         qa_json_path=args.qa_json,
         corpus_json_path=args.corpus_json,
-        template_path=args.config_yaml,
-        algo_config_path=args.algo_config_yaml,
+        config_path=args.config_yaml,
         eval_mode=args.eval_mode,
         report_path=args.report_path,
         score_weights=score_weights,
