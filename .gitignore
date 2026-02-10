@@ -1,4 +1,5 @@
-*
-!.gitignore
-!algorithms/
-!algorithms/**
+outputs/
+outputs*/
+/models/
+datasets*/
+datasets/
