@@ -10,11 +10,9 @@ prompt_templates:
 
 rag_search_space:
   rewriter:
-    model_url:
-      allowed: ["<url-1>", "<url-2>", "..."]
-    model_name:
-      allowed: ["<model-name-1>", "<model-name-2>", "..."]
-    api_key: "<key-1>"
+    model_url: "your model url"
+    model_name: "model name used"
+    api_key: "your api key"
     prompt_template_id:
       allowed: ["1", "2", "3"]
 
@@ -25,34 +23,31 @@ rag_search_space:
       allowed: [0, 64, 128, 192]
 
   clip:
-    model_url:
-      allowed: ["<url-1>", "<url-2>", "..."]
+    model_url: "your model url"
     topk:
       allowed: [1, 3, 5, 10, 20, 50]
 
   retrieve:
-    model_url:
-      allowed: ["<url-1>", "<url-2>", "..."]
+    model_url: "your model url"
     topk:
       allowed: [1, 3, 5, 10, 20, 50]
     bm25_weight:
       allowed: [0.0, 0.25, 0.5, 0.75, 1.0]
 
   reranker:
-    model_url:
-      allowed: ["<url-1>", "<url-2>", "..."]
+    model_url: "your model url"
     topk:
       allowed: [1, 3, 5, 10, 20, 50]
 
   generator:
-    model_url: "<url-1>"
-    model_name: "<model-name-1>"
-    api_key: "<key-1>"
+    model_url: "your model url"
+    model_name: "model name used"
+    api_key: "your api key"
 
 eval_metrics:
   llmaaj:
-    model_url: "<url>"
-    model_name: "<model-name>"
-    api_key: "<key>"
+    model_url: "your model url"
+    model_name: "model name used"
+    api_key: "your api key"
   bert: 
-    model_url: "<url>"
+    model_url: "your model url"

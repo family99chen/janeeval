@@ -1,8 +1,9 @@
 import asyncio
 import json
 import os
+import subprocess
 import sys
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 project_root = os.path.abspath(os.path.dirname(__file__))
 if project_root not in sys.path:
@@ -15,6 +16,22 @@ from rag.multimodal.pipeline import (
 )
 from rag.normal.pipeline import run_batch_async
 from rag.multimodal.pipeline import run_batch_async as run_batch_async_multimodal
+
+_DEFAULT_ALGORITHMS = [
+    "cross_entropy",
+    "randomalgo",
+    "greedy",
+    "grpo",
+    "iterative_local_search",
+    "mab_ts",
+    "mab_ucb",
+    "regularized_evolution",
+    "simulated_annealing",
+    "successive_halving",
+    "tpe",
+    "upperbound",
+    "thupperbound",
+]
 
 
 def _load_json_or_jsonl(path: str) -> List[Dict[str, Any]]:
@@ -148,6 +165,65 @@ def theoretical_getupperbound_multimodal(
         "eval_report": result.get("report"),
         "outputs": result.get("outputs"),
     }
+
+
+def run_algorithms(
+    qa_json_path: str,
+    corpus_json_path: str,
+    config_path: str,
+    algorithms: Optional[List[str]] = None,
+    eval_mode: str = "both",
+    score_weights: str = "",
+    extra_args: Optional[Dict[str, List[str]]] = None,
+    cwd: Optional[str] = None,
+) -> Dict[str, Any]:
+    algo_names = algorithms or list(_DEFAULT_ALGORITHMS)
+    algo_dir = os.path.join(project_root, "algorithms")
+    results: List[Dict[str, Any]] = []
+    for name in algo_names:
+        script = name if name.endswith(".py") else f"{name}.py"
+        script_path = os.path.join(algo_dir, script)
+        if not os.path.isfile(script_path):
+            results.append(
+                {
+                    "algorithm": name,
+                    "error": "script_not_found",
+                    "script_path": script_path,
+                }
+            )
+            continue
+        cmd = [
+            sys.executable,
+            script_path,
+            "--qa_json",
+            qa_json_path,
+            "--corpus_json",
+            corpus_json_path,
+            "--config_yaml",
+            config_path,
+            "--eval_mode",
+            eval_mode,
+        ]
+        if score_weights:
+            cmd.extend(["--score_weights", score_weights])
+        if extra_args and name in extra_args:
+            cmd.extend(extra_args[name])
+        completed = subprocess.run(
+            cmd,
+            cwd=cwd or project_root,
+            capture_output=True,
+            text=True,
+        )
+        results.append(
+            {
+                "algorithm": name,
+                "returncode": completed.returncode,
+                "stdout": completed.stdout,
+                "stderr": completed.stderr,
+                "cmd": cmd,
+            }
+        )
+    return {"results": results}
 
 
 def main() -> None:

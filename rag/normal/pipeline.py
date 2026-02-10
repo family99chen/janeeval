@@ -432,6 +432,7 @@ async def run_batch_async(
     eval_mode: str = "both",
     debug_dump: bool = False,
 ) -> Dict[str, Any]:
+    batch_t0 = time.perf_counter()
     result = await run_chunking_stage_async(
         data_json_path, selection_path, debug_dump=debug_dump
     )
@@ -486,10 +487,14 @@ async def run_batch_async(
             mode=eval_mode,
             eval_cfg=eval_cfg,
         )
+        batch_elapsed_seconds = time.perf_counter() - batch_t0
+        if isinstance(report, dict):
+            report["pipeline_total_time_seconds"] = batch_elapsed_seconds
         return {
             "debug_dump": result.get("debug_dump"),
             "outputs": outputs_clean,
             "report": report,
+            "pipeline_total_time_seconds": batch_elapsed_seconds,
         }
     finally:
         if client is not None and collection_name:
@@ -609,7 +614,7 @@ def getupperbound_external(
 def main() -> None:
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     selection_path = os.path.join(base_dir, "configs", "demo2.yaml")
-    data_json_path = os.path.join(base_dir, "rag", "normal", "testjson.json")
+    data_json_path = '/home/cz/ragsearch-jane/datasets/triviaqa/corpus.json'
     queries = [
         "I am a businessperson. What are OpenAI's main products?",
         "Who is Justin's mother?",
@@ -635,7 +640,7 @@ def main() -> None:
         print("chroma_debug_dump:")
         print(result["debug_dump"])
     print("batch_outputs:")
-    print(result["outputs"])
+    #print(result["outputs"])
     print("eval_report:")
     print(result["report"])
 
