@@ -1,5 +1,4 @@
-outputs/
-outputs*/
-/models/
-datasets*/
-datasets/
+*
+!.gitignore
+!algorithms/
+!algorithms/**

@@ -1,5 +1,4 @@
 import json
-import math
 import os
 import random
 import sys
@@ -58,7 +57,9 @@ def _allowed_values(node: Any) -> List[Any]:
     return [v for v in allowed if v != "..."]
 
 
-def _split_config(config: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
+def _split_config(
+    config: Dict[str, Any]
+) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
     search_space = config.get("rag_search_space") or {}
     eval_metrics = config.get("eval_metrics")
     algo_cfg = {
@@ -180,7 +181,7 @@ def _sanitize_selection(selection: Dict[str, Any]) -> None:
 
 
 def _write_temp_selection(selection: Dict[str, Any]) -> str:
-    fd, path = tempfile.mkstemp(prefix="mab_ts_selection_", suffix=".yaml")
+    fd, path = tempfile.mkstemp(prefix="ils_selection_", suffix=".yaml")
     os.close(fd)
     _dump_yaml(selection, path)
     return path
@@ -199,6 +200,26 @@ def _set_eval_schema_env(config_path: str, use_multimodal: bool) -> None:
         os.environ["RAGSEARCH_CONFIG"] = config_path
 
 
+def _module_forced_on(algo_cfg: Dict[str, Any], module: str) -> bool:
+    if not isinstance(algo_cfg, dict):
+        return False
+    section = algo_cfg.get(module)
+    return isinstance(section, dict) and len(section) > 0
+
+
+def _param_choices(value: Any, override: Optional[List[Any]]) -> List[Any]:
+    if override:
+        return override
+    allowed = _allowed_values(value)
+    if allowed:
+        return allowed
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return []
+    return [value]
+
+
 def _paired_model_choices(
     params: Dict[str, Any], algo_cfg: Dict[str, Any], module: str
 ) -> Optional[List[Tuple[Any, Any]]]:
@@ -206,24 +227,45 @@ def _paired_model_choices(
         return None
     url_override = _override_choices(module, "model_url", algo_cfg)
     name_override = _override_choices(module, "model_name", algo_cfg)
-    url_choices = _allowed_values(params.get("model_url"))
-    if url_override:
-        url_choices = url_override
-    name_choices = _allowed_values(params.get("model_name"))
-    if name_override:
-        name_choices = name_override
+    url_choices = _param_choices(params.get("model_url"), url_override)
+    name_choices = _param_choices(params.get("model_name"), name_override)
     if not url_choices or not name_choices:
+        return None
+    if any(choice is None for choice in url_choices) or any(
+        choice is None for choice in name_choices
+    ):
         return None
     if len(url_choices) != len(name_choices):
         return None
     return list(zip(url_choices, name_choices))
 
 
-def _module_forced_on(algo_cfg: Dict[str, Any], module: str) -> bool:
-    if not isinstance(algo_cfg, dict):
-        return False
-    section = algo_cfg.get(module)
-    return isinstance(section, dict) and len(section) > 0
+def _random_module_selection(
+    module: str,
+    params: Dict[str, Any],
+    algo_cfg: Dict[str, Any],
+    rng: random.Random,
+    force_on: bool = False,
+) -> Optional[Dict[str, Any]]:
+    optional_modules = {"rewriter", "reranker", "pruner"}
+    is_optional = module in optional_modules
+    if is_optional and not force_on and not _module_forced_on(algo_cfg, module):
+        if rng.random() < 0.5:
+            return None
+    selection: Dict[str, Any] = {}
+    pair_choices = _paired_model_choices(params, algo_cfg, module)
+    if pair_choices:
+        choice = rng.choice(pair_choices)
+        selection["model_url"] = choice[0]
+        selection["model_name"] = choice[1]
+    for key, value in params.items():
+        if pair_choices and key in {"model_url", "model_name"}:
+            continue
+        override = _override_choices(module, key, algo_cfg)
+        choices = _param_choices(value, override)
+        if choices:
+            selection[key] = rng.choice(choices)
+    return selection or None
 
 
 def _random_selection(
@@ -235,55 +277,126 @@ def _random_selection(
     for module, params in search_space.items():
         if not isinstance(params, dict):
             continue
-        is_optional = module in {"rewriter", "reranker", "pruner"}
-        if is_optional and not _module_forced_on(algo_cfg, module) and rng.random() < 0.5:
-            continue
-
-        selection[module] = {}
-        pair_choices = _paired_model_choices(params, algo_cfg, module)
-        if pair_choices:
-            choice = rng.choice(pair_choices)
-            selection[module]["model_url"] = choice[0]
-            selection[module]["model_name"] = choice[1]
-        for key, value in params.items():
-            if pair_choices and key in {"model_url", "model_name"}:
-                continue
-            choices = _allowed_values(value)
-            override = _override_choices(module, key, algo_cfg)
-            if override:
-                choices = override
-            if choices:
-                selection[module][key] = rng.choice(choices)
-        if not selection[module]:
-            selection.pop(module, None)
+        module_selection = _random_module_selection(module, params, algo_cfg, rng)
+        if module_selection:
+            selection[module] = module_selection
     return selection
 
 
-def _build_config_pool(
+def _build_param_specs(
     search_space: Dict[str, Any],
     algo_cfg: Dict[str, Any],
-    eval_metrics: Optional[Dict[str, Any]],
-    pool_size: int,
-    seed: int,
+    module_order: List[str],
 ) -> List[Dict[str, Any]]:
-    rng = random.Random(seed)
-    pool: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-    attempts = 0
-    max_attempts = max(pool_size * 50, 100)
-    while len(pool) < pool_size and attempts < max_attempts:
-        attempts += 1
-        candidate = _random_selection(search_space, algo_cfg, rng)
-        if eval_metrics:
-            candidate["eval_metrics"] = eval_metrics
-        if algo_cfg:
-            candidate = _deep_update(candidate, algo_cfg)
-        key = json.dumps(candidate, sort_keys=True, ensure_ascii=False)
-        if key in seen:
+    specs: List[Dict[str, Any]] = []
+    optional_modules = {"rewriter", "reranker", "pruner"}
+    for module in module_order:
+        params = search_space.get(module)
+        if not isinstance(params, dict):
             continue
-        seen.add(key)
-        pool.append(candidate)
-    return pool
+        is_optional = module in optional_modules
+        forced_on = _module_forced_on(algo_cfg, module)
+        if is_optional and not forced_on:
+            specs.append(
+                {
+                    "name": f"{module}.__enabled__",
+                    "module": module,
+                    "key": "__enabled__",
+                    "choices": [True, False],
+                    "is_enable": True,
+                }
+            )
+        pair_choices = _paired_model_choices(params, algo_cfg, module)
+        if pair_choices and len(pair_choices) > 1:
+            specs.append(
+                {
+                    "name": f"{module}.__model_pair__",
+                    "module": module,
+                    "key": "__model_pair__",
+                    "choices": pair_choices,
+                    "is_enable": False,
+                }
+            )
+        for key, value in params.items():
+            if pair_choices and key in {"model_url", "model_name"}:
+                continue
+            override = _override_choices(module, key, algo_cfg)
+            choices = _param_choices(value, override)
+            if len(choices) <= 1:
+                continue
+            specs.append(
+                {
+                    "name": f"{module}.{key}",
+                    "module": module,
+                    "key": key,
+                    "choices": choices,
+                    "is_enable": False,
+                }
+            )
+    return specs
+
+
+def _mutate_selection(
+    selection: Dict[str, Any],
+    specs: List[Dict[str, Any]],
+    search_space: Dict[str, Any],
+    algo_cfg: Dict[str, Any],
+    rng: random.Random,
+) -> Dict[str, Any]:
+    candidate = json.loads(json.dumps(selection))
+    available: List[Dict[str, Any]] = []
+    for spec in specs:
+        module = spec["module"]
+        if spec["is_enable"]:
+            available.append(spec)
+        else:
+            if module in candidate:
+                available.append(spec)
+    if not available:
+        return candidate
+    spec = rng.choice(available)
+    module = spec["module"]
+    if spec["is_enable"]:
+        if module in candidate:
+            candidate.pop(module, None)
+            return candidate
+        params = search_space.get(module)
+        if isinstance(params, dict):
+            module_sel = _random_module_selection(
+                module, params, algo_cfg, rng, force_on=True
+            )
+            if module_sel:
+                candidate[module] = module_sel
+        return candidate
+    if module not in candidate:
+        return candidate
+    if spec["key"] == "__model_pair__":
+        current = (candidate[module].get("model_url"), candidate[module].get("model_name"))
+        choices = [c for c in spec["choices"] if c != current and None not in c]
+        if choices:
+            choice = rng.choice(choices)
+            candidate[module]["model_url"] = choice[0]
+            candidate[module]["model_name"] = choice[1]
+        return candidate
+    current_val = candidate[module].get(spec["key"])
+    choices = [c for c in spec["choices"] if c != current_val]
+    if not choices:
+        return candidate
+    candidate[module][spec["key"]] = rng.choice(choices)
+    return candidate
+
+
+def _prepare_selection(
+    selection: Dict[str, Any],
+    algo_cfg: Dict[str, Any],
+    eval_metrics: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    candidate = json.loads(json.dumps(selection))
+    if eval_metrics:
+        candidate["eval_metrics"] = eval_metrics
+    if algo_cfg:
+        candidate = _deep_update(candidate, algo_cfg)
+    return candidate
 
 
 def _evaluate_selection(
@@ -318,14 +431,14 @@ def _evaluate_selection(
     }
 
 
-def mab_ts_search(
+def iterative_local_search(
     qa_json_path: str,
     corpus_json_path: str,
     config_path: str,
     eval_mode: str,
     report_path: str,
-    budget: int,
-    pool_size: int,
+    restarts: int,
+    steps_per_restart: int,
     seed: int,
     score_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
@@ -338,19 +451,20 @@ def mab_ts_search(
     if isinstance(algo_cfg, dict):
         preferred_metric = algo_cfg.get("score_metric") or algo_cfg.get("metric")
 
-    configs = _build_config_pool(search_space, algo_cfg, eval_metrics, pool_size, seed)
-    n_arms = len(configs)
-    if n_arms == 0 or budget <= 0:
-        return {"best_score": 0.0, "best_config": {}, "trials": [], "pool_size": 0}
-
     rng = random.Random(seed)
-    counts = [0] * n_arms
-    means = [0.0] * n_arms
-    sum_squares = [0.0] * n_arms  # Track sum of squared rewards for variance calculation
-    invalid = [False] * n_arms
+    module_order = ["rewriter", "chunking", "retrieve", "clip", "reranker", "pruner", "generator"]
+    specs = _build_param_specs(search_space, algo_cfg, module_order)
+
     trials: List[Dict[str, Any]] = []
     best_score: float = float("-inf")
     best_config: Dict[str, Any] = {}
+    step_idx = 0
+
+    ils_cfg = algo_cfg if isinstance(algo_cfg, dict) else {}
+    perturb_steps = max(1, int(ils_cfg.get("ils_perturb_steps", 2)))
+    local_steps = max(1, int(ils_cfg.get("ils_local_steps", max(3, len(specs)))))
+    patience = max(1, int(ils_cfg.get("ils_patience", max(1, local_steps // 2))))
+    accept_equal = bool(ils_cfg.get("ils_accept_equal", True))
 
     def _write_report_snapshot() -> None:
         report_dir = os.path.dirname(report_path)
@@ -360,86 +474,134 @@ def mab_ts_search(
             "best_score": best_score if best_score != float("-inf") else 0.0,
             "best_config": best_config,
             "trials": trials,
-            "pool_size": n_arms,
-            "budget": budget,
         }
         with open(report_path, "w", encoding="utf-8") as handle:
             json.dump(snapshot, handle, ensure_ascii=False, indent=2)
 
-    bar = tqdm(total=budget, desc="mab-ts", unit="trial") if tqdm else None
-    attempts = 0
-    max_attempts = max(10, int(budget) * 50)
-    while len(trials) < budget and attempts < max_attempts:
-        attempts += 1
-        samples = []
-        for i in range(n_arms):
-            if invalid[i]:
-                samples.append(float("-inf"))
-                continue
-            mu = means[i]
-            # Calculate variance based on observed rewards
-            if counts[i] > 1:
-                # Sample variance: Var = E[X^2] - E[X]^2
-                variance = (sum_squares[i] / counts[i]) - (mu * mu)
-                variance = max(variance, 1e-6)  # Ensure positive variance
-                # Standard error of the mean
-                sigma = math.sqrt(variance / counts[i])
-            else:
-                # Use large uncertainty for unexplored arms
-                sigma = 1.0
-            samples.append(rng.gauss(mu, sigma))
-        if all(v == float("-inf") for v in samples):
-            break
-        arm = max(range(n_arms), key=lambda i: samples[i])
+    bar = tqdm(desc="ils", unit="step") if tqdm else None
 
-        score, payload = _evaluate_selection(
-            qa_json_path,
-            corpus_json_path,
-            configs[arm],
-            eval_mode,
-            preferred_metric,
-            score_weights,
-            eval_fn,
-        )
-        if payload.get("error"):
-            invalid[arm] = True
-            continue
-
+    def _write_record(
+        restart_id: int,
+        step_id: int,
+        phase: str,
+        score: float,
+        payload: Dict[str, Any],
+        candidate: Dict[str, Any],
+    ) -> None:
+        nonlocal best_score, best_config
         record = {
-            "index": len(trials) + 1,
-            "score": payload.get("score"),
+            "restart": restart_id,
+            "step": step_id,
+            "phase": phase,
+            "score": score,
             "metric": payload.get("metric"),
-            "selection": configs[arm],
+            "selection": candidate,
             "report": payload.get("report"),
             "outputs": payload.get("outputs"),
             "error": payload.get("error"),
             "errors": payload.get("errors"),
         }
         trials.append(record)
-
-        counts[arm] += 1
-        n = counts[arm]
-        old_mean = means[arm]
-        means[arm] += (score - means[arm]) / n
-        # Update sum of squares for variance calculation
-        sum_squares[arm] += score * score
-
         if score >= best_score:
             best_score = score
-            best_config = json.loads(json.dumps(configs[arm]))
+            best_config = json.loads(json.dumps(candidate))
         _write_report_snapshot()
-        if bar:
+        if bar is not None:
             bar.update(1)
 
-    if bar:
+    def _evaluate_and_record(
+        selection: Dict[str, Any], restart_id: int, step_id: int, phase: str
+    ) -> Tuple[float, Dict[str, Any]]:
+        candidate = _prepare_selection(selection, algo_cfg, eval_metrics)
+        score, payload = _evaluate_selection(
+            qa_json_path,
+            corpus_json_path,
+            candidate,
+            eval_mode,
+            preferred_metric,
+            score_weights,
+            eval_fn,
+        )
+        if payload.get("error"):
+            score = -1.0
+        _write_record(restart_id, step_id, phase, score, payload, candidate)
+        return score, candidate
+
+    def _apply_mutations(selection: Dict[str, Any], count: int) -> Dict[str, Any]:
+        mutated = json.loads(json.dumps(selection))
+        for _ in range(count):
+            mutated = _mutate_selection(mutated, specs, search_space, algo_cfg, rng)
+        return mutated
+
+    def _local_search(
+        selection: Dict[str, Any],
+        score: float,
+        candidate: Dict[str, Any],
+        restart_id: int,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], float]:
+        nonlocal step_idx
+        current_selection = json.loads(json.dumps(selection))
+        current_candidate = json.loads(json.dumps(candidate))
+        current_score = score
+        no_improve = 0
+        for _ in range(local_steps):
+            step_idx += 1
+            mutated = _mutate_selection(
+                current_selection, specs, search_space, algo_cfg, rng
+            )
+            mutated_score, mutated_candidate = _evaluate_and_record(
+                mutated, restart_id, step_idx, "local"
+            )
+            if mutated_score > current_score or (
+                accept_equal and mutated_score == current_score
+            ):
+                current_selection = json.loads(json.dumps(mutated))
+                current_candidate = json.loads(json.dumps(mutated_candidate))
+                current_score = mutated_score
+                no_improve = 0
+            else:
+                no_improve += 1
+            if no_improve >= patience:
+                break
+        return current_selection, current_candidate, current_score
+
+    for restart in range(restarts):
+        current_selection = _random_selection(search_space, algo_cfg, rng)
+        step_idx = 0
+        current_score, current_candidate = _evaluate_and_record(
+            current_selection, restart + 1, step_idx, "init"
+        )
+        current_selection, current_candidate, current_score = _local_search(
+            current_selection, current_score, current_candidate, restart + 1
+        )
+
+        for _ in range(steps_per_restart):
+            step_idx += 1
+            perturbed = _apply_mutations(current_selection, perturb_steps)
+            perturbed_score, perturbed_candidate = _evaluate_and_record(
+                perturbed, restart + 1, step_idx, "perturb"
+            )
+            (
+                perturbed_selection,
+                perturbed_candidate,
+                perturbed_score,
+            ) = _local_search(
+                perturbed, perturbed_score, perturbed_candidate, restart + 1
+            )
+            if perturbed_score > current_score or (
+                accept_equal and perturbed_score == current_score
+            ):
+                current_selection = json.loads(json.dumps(perturbed_selection))
+                current_candidate = json.loads(json.dumps(perturbed_candidate))
+                current_score = perturbed_score
+
+    if bar is not None:
         bar.close()
 
     result = {
         "best_score": best_score if best_score != float("-inf") else 0.0,
         "best_config": best_config,
         "trials": trials,
-        "pool_size": n_arms,
-        "budget": budget,
     }
     _write_report_snapshot()
     return result
@@ -449,10 +611,10 @@ def main() -> None:
     import argparse
 
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    default_algo_config = os.path.join(base_dir, "algorithms", "configforalgo.yaml")
-    default_report = os.path.join(base_dir, "outputs", "mab_ts_report.json")
+    default_algo_config = os.path.join(os.path.dirname(__file__), "configforalgo.yaml")
+    default_report = os.path.join(base_dir, "outputs", "ils_report.json")
 
-    parser = argparse.ArgumentParser(description="MAB Thompson Sampling search for RAG.")
+    parser = argparse.ArgumentParser(description="Iterative local search for RAG.")
     parser.add_argument("--qa_json", required=True, help="Path to QA JSON/JSONL.")
     parser.add_argument("--corpus_json", required=True, help="Path to corpus JSON.")
     parser.add_argument(
@@ -472,16 +634,16 @@ def main() -> None:
         help="Path to write report JSON.",
     )
     parser.add_argument(
-        "--budget",
+        "--restarts",
         type=int,
-        default=20,
-        help="Number of evaluations to run.",
+        default=4,
+        help="Number of random restarts.",
     )
     parser.add_argument(
-        "--pool_size",
+        "--steps_per_restart",
         type=int,
-        default=50,
-        help="Number of candidate configs to build.",
+        default=6,
+        help="Steps per restart.",
     )
     parser.add_argument(
         "--seed",
@@ -497,19 +659,17 @@ def main() -> None:
     args = parser.parse_args()
 
     score_weights = _parse_score_weights(args.score_weights)
-    result = mab_ts_search(
+    iterative_local_search(
         qa_json_path=args.qa_json,
         corpus_json_path=args.corpus_json,
         config_path=args.config_yaml,
         eval_mode=args.eval_mode,
         report_path=args.report_path,
-        budget=args.budget,
-        pool_size=args.pool_size,
+        restarts=args.restarts,
+        steps_per_restart=args.steps_per_restart,
         seed=args.seed,
         score_weights=score_weights,
     )
-    print("\n[summary] best_score:", result.get("best_score"))
-    print("[summary] best_config:", json.dumps(result.get("best_config"), ensure_ascii=False))
 
 
 if __name__ == "__main__":

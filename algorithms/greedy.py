@@ -437,6 +437,7 @@ def greedy_search(
 
         # Greedy per-parameter (module on)
         best_on_score = float("-inf")
+        best_on_config = None
         if module in current or not is_optional:
             pair_choices = _paired_model_choices(params, algo_cfg, module)
             if pair_choices:
@@ -481,9 +482,19 @@ def greedy_search(
                     current.setdefault(module, {})
                     current[module][key] = best_val
                     best_on_score = max(best_on_score, best_val_score)
+            
+            # Evaluate final "on" configuration
+            final_on_candidate = json.loads(json.dumps(current))
+            final_on_score, _ = run_trial(f"{module}:final_on", final_on_candidate)
+            best_on_score = final_on_score
+            best_on_config = final_on_candidate
 
-        if is_optional and score_off >= best_on_score:
-            current.pop(module, None)
+        # Compare off vs best on configuration
+        if is_optional:
+            if score_off >= best_on_score:
+                current.pop(module, None)
+            elif best_on_config is not None:
+                current = best_on_config
 
     if bar:
         if bar.total != len(trials):
