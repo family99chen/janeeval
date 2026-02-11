@@ -229,6 +229,7 @@ def _paired_model_choices(
 class PolicyNetwork:
     def __init__(self, search_space: Dict[str, Any], algo_cfg: Dict[str, Any]):
         self.params: List[Dict[str, Any]] = []
+        self.fixed_params: Dict[str, Dict[str, Any]] = {}
         # Each param: { "name": str, "module": str, "key": str, "choices": list, "logits": list[float] }
         
         module_order = ["rewriter", "chunking", "retrieve", "clip", "reranker", "pruner", "generator"]
@@ -281,6 +282,8 @@ class PolicyNetwork:
                         "choices": choices,
                         "logits": [0.0] * len(choices)
                     })
+                else:
+                    self.fixed_params.setdefault(module, {})[key] = choices[0]
 
     def softmax(self, logits: List[float]) -> List[float]:
         if not logits:
@@ -292,7 +295,7 @@ class PolicyNetwork:
 
     def sample(self, rng: random.Random) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         selection: Dict[str, Any] = {}
-        trajectory: List[Dict[str, Any]] = []  # { "param_idx": int, "choice_idx": int }
+        trajectory: List[Dict[str, Any]] = []
         
         # Modules enabled status
         enabled_modules = set()
@@ -303,13 +306,21 @@ class PolicyNetwork:
                 probs = self.softmax(param["logits"])
                 choice_idx = self._choice_index(rng, probs)
                 is_enabled = param["choices"][choice_idx]
-                trajectory.append({"param_idx": idx, "choice_idx": choice_idx})
+                logp = math.log(max(probs[choice_idx], 1e-12))
+                trajectory.append({"param_idx": idx, "choice_idx": choice_idx, "logp": logp})
                 if is_enabled:
                     enabled_modules.add(param["module"])
             elif param["module"] not in ["rewriter", "reranker", "pruner"]:
                  enabled_modules.add(param["module"])
 
         # Second pass: Select values for enabled modules
+        for module in enabled_modules:
+            fixed = self.fixed_params.get(module)
+            if fixed:
+                selection.setdefault(module, {})
+                for key, value in fixed.items():
+                    selection[module].setdefault(key, value)
+
         for idx, param in enumerate(self.params):
             module = param["module"]
             if param["key"] == "__enabled__":
@@ -321,7 +332,8 @@ class PolicyNetwork:
             probs = self.softmax(param["logits"])
             choice_idx = self._choice_index(rng, probs)
             choice_val = param["choices"][choice_idx]
-            trajectory.append({"param_idx": idx, "choice_idx": choice_idx})
+            logp = math.log(max(probs[choice_idx], 1e-12))
+            trajectory.append({"param_idx": idx, "choice_idx": choice_idx, "logp": logp})
 
             selection.setdefault(module, {})
             
@@ -356,6 +368,8 @@ class PolicyNetwork:
         ref_logits: List[List[float]],
         learning_rate: float,
         kl_coeff: float,
+        clip_ratio: float,
+        update_epochs: int,
     ) -> None:
         if not rewards:
             return
@@ -365,39 +379,31 @@ class PolicyNetwork:
         denom = std if std > 0 else 1.0
         advantages = [(r - mean) / denom for r in rewards]
 
-        # Accumulate gradients to ensure batch update
-        logits_updates = [[0.0] * len(p["logits"]) for p in self.params]
-
-        for traj, adv in zip(trajectories, advantages):
-            for step in traj:
-                param_idx = step["param_idx"]
-                choice_idx = step["choice_idx"]
-                param = self.params[param_idx]
-                
-                # Compute probabilities using current logits (sampling policy)
-                # Note: In true PPO/GRPO, we should use importance sampling ratio (pi_new / pi_old).
-                # Since we do single-step update here, pi_new approx pi_old, so ratio approx 1.
-                # We use current logits to compute gradients.
-                probs = self.softmax(param["logits"])
-                ref_probs = self.softmax(ref_logits[param_idx])
-                
+        epochs = max(1, int(update_epochs))
+        clip_ratio = max(0.0, float(clip_ratio))
+        for _ in range(epochs):
+            logits_updates = [[0.0] * len(p["logits"]) for p in self.params]
+            for traj, adv in zip(trajectories, advantages):
+                for step in traj:
+                    param_idx = step["param_idx"]
+                    choice_idx = step["choice_idx"]
+                    old_logp = float(step.get("logp", 0.0))
+                    param = self.params[param_idx]
+                    probs = self.softmax(param["logits"])
+                    ref_probs = self.softmax(ref_logits[param_idx])
+                    new_logp = math.log(max(probs[choice_idx], 1e-12))
+                    ratio = math.exp(new_logp - old_logp)
+                    if adv >= 0:
+                        ratio_used = min(ratio, 1.0 + clip_ratio)
+                    else:
+                        ratio_used = max(ratio, 1.0 - clip_ratio)
+                    for j in range(len(param["logits"])):
+                        pg_grad = (1.0 if j == choice_idx else 0.0) - probs[j]
+                        kl_grad = probs[j] - ref_probs[j]
+                        logits_updates[param_idx][j] += learning_rate * (ratio_used * adv * pg_grad - kl_coeff * kl_grad)
+            for i, param in enumerate(self.params):
                 for j in range(len(param["logits"])):
-                    # PG gradient: grad_log_pi * adv
-                    # grad_log_pi(j) = (1 if j==choice else 0) - probs[j]
-                    pg_grad = (1.0 if j == choice_idx else 0.0) - probs[j]
-                    
-                    # KL gradient: grad ( - beta * KL(ref || pi) )
-                    # Simplifying to Reverse-KL regularization: push pi towards ref
-                    # direction ~ (ref - pi), so gradient term is (probs - ref_probs)
-                    # We subtract kl_coeff * (probs - ref_probs) which equals adding kl_coeff * (ref - probs)
-                    kl_grad = probs[j] - ref_probs[j]
-                    
-                    logits_updates[param_idx][j] += learning_rate * (adv * pg_grad - kl_coeff * kl_grad)
-
-        # Apply updates
-        for i, param in enumerate(self.params):
-            for j in range(len(param["logits"])):
-                param["logits"][j] += logits_updates[i][j]
+                    param["logits"][j] += logits_updates[i][j]
 
 
 def _evaluate_selection(
@@ -428,6 +434,7 @@ def _evaluate_selection(
         "report": report,
         "pipeline_total_time_seconds": report.get("pipeline_total_time_seconds"),
         "outputs": result.get("outputs"),
+        "chunking": result.get("chunking"),
         "error": result.get("error"),
         "errors": result.get("errors"),
     }
@@ -444,6 +451,8 @@ def rl_search(
     learning_rate: float = 0.1,
     group_size: int = 4,
     kl_coeff: float = 0.02,
+    clip_ratio: float = 0.2,
+    update_epochs: int = 2,
     score_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     config = _load_yaml(config_path)
@@ -519,6 +528,7 @@ def rl_search(
                 "report": payload.get("report"),
                 "pipeline_total_time_seconds": payload.get("pipeline_total_time_seconds"),
                 "outputs": payload.get("outputs"),
+                "chunking": payload.get("chunking"),
                 "error": payload.get("error"),
                 "errors": payload.get("errors"),
             }
@@ -536,6 +546,8 @@ def rl_search(
             ref_logits=ref_logits,
             learning_rate=learning_rate,
             kl_coeff=kl_coeff,
+            clip_ratio=clip_ratio,
+            update_epochs=update_epochs,
         )
         if bar:
             bar.update(1)
@@ -609,6 +621,18 @@ def main() -> None:
         help="KL penalty coefficient.",
     )
     parser.add_argument(
+        "--clip_ratio",
+        type=float,
+        default=0.2,
+        help="PPO clip ratio.",
+    )
+    parser.add_argument(
+        "--update_epochs",
+        type=int,
+        default=2,
+        help="Policy update epochs per group.",
+    )
+    parser.add_argument(
         "--score_weights",
         default="",
         help="Weighted metrics, e.g. 'bertf11,llmaaj2'.",
@@ -627,6 +651,8 @@ def main() -> None:
         learning_rate=args.lr,
         group_size=args.group_size,
         kl_coeff=args.kl_coeff,
+        clip_ratio=args.clip_ratio,
+        update_epochs=args.update_epochs,
         score_weights=score_weights,
     )
 

@@ -428,6 +428,7 @@ def _evaluate_selection(
         "report": report,
         "pipeline_total_time_seconds": report.get("pipeline_total_time_seconds"),
         "outputs": result.get("outputs"),
+        "chunking": result.get("chunking"),
         "error": result.get("error"),
         "errors": result.get("errors"),
     }
@@ -496,6 +497,7 @@ def simulated_annealing_search(
         "report": current_payload.get("report"),
         "pipeline_total_time_seconds": current_payload.get("pipeline_total_time_seconds"),
         "outputs": current_payload.get("outputs"),
+        "chunking": current_payload.get("chunking"),
         "error": current_payload.get("error"),
         "errors": current_payload.get("errors"),
         "temp": float(start_temp),
@@ -558,6 +560,7 @@ def simulated_annealing_search(
             "report": payload.get("report"),
             "pipeline_total_time_seconds": payload.get("pipeline_total_time_seconds"),
             "outputs": payload.get("outputs"),
+            "chunking": payload.get("chunking"),
             "error": payload.get("error"),
             "errors": payload.get("errors"),
             "temp": float(temp),

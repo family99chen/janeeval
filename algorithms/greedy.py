@@ -318,6 +318,7 @@ def _evaluate_selection(
         "report": report,
         "pipeline_total_time_seconds": report.get("pipeline_total_time_seconds"),
         "outputs": result.get("outputs"),
+        "chunking": result.get("chunking"),
         "error": result.get("error"),
         "errors": result.get("errors"),
     }
@@ -411,6 +412,7 @@ def greedy_search(
             "report": payload.get("report"),
             "pipeline_total_time_seconds": payload.get("pipeline_total_time_seconds"),
             "outputs": payload.get("outputs"),
+            "chunking": payload.get("chunking"),
             "error": payload.get("error"),
             "errors": payload.get("errors"),
         }

@@ -386,6 +386,61 @@ def _mutate_selection(
     return candidate
 
 
+def _enumerate_neighbors(
+    selection: Dict[str, Any],
+    specs: List[Dict[str, Any]],
+    search_space: Dict[str, Any],
+    algo_cfg: Dict[str, Any],
+    rng: random.Random,
+    max_neighbors: int,
+) -> List[Dict[str, Any]]:
+    neighbors: List[Dict[str, Any]] = []
+    for spec in specs:
+        module = spec["module"]
+        if spec["is_enable"]:
+            if module in selection:
+                candidate = json.loads(json.dumps(selection))
+                candidate.pop(module, None)
+                neighbors.append(candidate)
+                continue
+            params = search_space.get(module)
+            if isinstance(params, dict):
+                module_sel = _random_module_selection(
+                    module, params, algo_cfg, rng, force_on=True
+                )
+                if module_sel:
+                    candidate = json.loads(json.dumps(selection))
+                    candidate[module] = module_sel
+                    neighbors.append(candidate)
+            continue
+        if module not in selection:
+            continue
+        if spec["key"] == "__model_pair__":
+            current = (
+                selection[module].get("model_url"),
+                selection[module].get("model_name"),
+            )
+            for choice in spec["choices"]:
+                if choice == current or None in choice:
+                    continue
+                candidate = json.loads(json.dumps(selection))
+                candidate[module]["model_url"] = choice[0]
+                candidate[module]["model_name"] = choice[1]
+                neighbors.append(candidate)
+            continue
+        current_val = selection[module].get(spec["key"])
+        for choice in spec["choices"]:
+            if choice == current_val:
+                continue
+            candidate = json.loads(json.dumps(selection))
+            candidate[module][spec["key"]] = choice
+            neighbors.append(candidate)
+    if max_neighbors > 0 and len(neighbors) > max_neighbors:
+        rng.shuffle(neighbors)
+        neighbors = neighbors[:max_neighbors]
+    return neighbors
+
+
 def _prepare_selection(
     selection: Dict[str, Any],
     algo_cfg: Dict[str, Any],
@@ -427,6 +482,7 @@ def _evaluate_selection(
         "report": report,
         "pipeline_total_time_seconds": report.get("pipeline_total_time_seconds"),
         "outputs": result.get("outputs"),
+        "chunking": result.get("chunking"),
         "error": result.get("error"),
         "errors": result.get("errors"),
     }
@@ -442,6 +498,10 @@ def iterative_local_search(
     steps_per_restart: int,
     seed: int,
     score_weights: Optional[Dict[str, float]] = None,
+    ils_perturb_steps: Optional[int] = None,
+    ils_local_steps: Optional[int] = None,
+    ils_neighborhood_size: Optional[int] = None,
+    ils_accept_equal: Optional[bool] = None,
 ) -> Dict[str, Any]:
     config = _load_yaml(config_path)
     search_space, algo_cfg, eval_metrics = _split_config(config)
@@ -464,8 +524,16 @@ def iterative_local_search(
     ils_cfg = algo_cfg if isinstance(algo_cfg, dict) else {}
     perturb_steps = max(1, int(ils_cfg.get("ils_perturb_steps", 2)))
     local_steps = max(1, int(ils_cfg.get("ils_local_steps", max(3, len(specs)))))
-    patience = max(1, int(ils_cfg.get("ils_patience", max(1, local_steps // 2))))
     accept_equal = bool(ils_cfg.get("ils_accept_equal", True))
+    neighborhood_size = max(0, int(ils_cfg.get("ils_neighborhood_size", 0)))
+    if ils_perturb_steps is not None:
+        perturb_steps = max(1, int(ils_perturb_steps))
+    if ils_local_steps is not None:
+        local_steps = max(1, int(ils_local_steps))
+    if ils_neighborhood_size is not None:
+        neighborhood_size = max(0, int(ils_neighborhood_size))
+    if ils_accept_equal is not None:
+        accept_equal = bool(ils_accept_equal)
 
     def _write_report_snapshot() -> None:
         report_dir = os.path.dirname(report_path)
@@ -500,6 +568,7 @@ def iterative_local_search(
             "report": payload.get("report"),
             "pipeline_total_time_seconds": payload.get("pipeline_total_time_seconds"),
             "outputs": payload.get("outputs"),
+            "chunking": payload.get("chunking"),
             "error": payload.get("error"),
             "errors": payload.get("errors"),
         }
@@ -545,25 +614,40 @@ def iterative_local_search(
         current_selection = json.loads(json.dumps(selection))
         current_candidate = json.loads(json.dumps(candidate))
         current_score = score
-        no_improve = 0
         for _ in range(local_steps):
-            step_idx += 1
-            mutated = _mutate_selection(
-                current_selection, specs, search_space, algo_cfg, rng
+            neighbors = _enumerate_neighbors(
+                current_selection,
+                specs,
+                search_space,
+                algo_cfg,
+                rng,
+                neighborhood_size,
             )
-            mutated_score, mutated_candidate = _evaluate_and_record(
-                mutated, restart_id, step_idx, "local"
-            )
-            if mutated_score > current_score or (
-                accept_equal and mutated_score == current_score
+            if not neighbors:
+                break
+            best_neighbor: Optional[Dict[str, Any]] = None
+            best_candidate = current_candidate
+            best_score = current_score
+            for neighbor in neighbors:
+                step_idx += 1
+                neighbor_score, neighbor_candidate = _evaluate_and_record(
+                    neighbor, restart_id, step_idx, "local"
+                )
+                if neighbor_score > best_score or (
+                    accept_equal and neighbor_score == best_score and best_neighbor is None
+                ):
+                    best_score = neighbor_score
+                    best_neighbor = neighbor
+                    best_candidate = neighbor_candidate
+            if best_neighbor is None:
+                break
+            if best_score > current_score or (
+                accept_equal and best_score == current_score
             ):
-                current_selection = json.loads(json.dumps(mutated))
-                current_candidate = json.loads(json.dumps(mutated_candidate))
-                current_score = mutated_score
-                no_improve = 0
+                current_selection = json.loads(json.dumps(best_neighbor))
+                current_candidate = json.loads(json.dumps(best_candidate))
+                current_score = best_score
             else:
-                no_improve += 1
-            if no_improve >= patience:
                 break
         return current_selection, current_candidate, current_score
 
@@ -658,6 +742,36 @@ def main() -> None:
         default="",
         help="Weighted metrics, e.g. 'bertf11,llmaaj2'.",
     )
+    parser.add_argument(
+        "--ils_perturb_steps",
+        type=int,
+        default=None,
+        help="Override ils_perturb_steps in YAML.",
+    )
+    parser.add_argument(
+        "--ils_local_steps",
+        type=int,
+        default=None,
+        help="Override ils_local_steps in YAML.",
+    )
+    parser.add_argument(
+        "--ils_neighborhood_size",
+        type=int,
+        default=None,
+        help="Override ils_neighborhood_size in YAML (0 = full enumeration).",
+    )
+    parser.add_argument(
+        "--ils_accept_equal",
+        action="store_true",
+        default=None,
+        help="Override ils_accept_equal=True.",
+    )
+    parser.add_argument(
+        "--no_ils_accept_equal",
+        action="store_false",
+        dest="ils_accept_equal",
+        help="Override ils_accept_equal=False.",
+    )
     args = parser.parse_args()
 
     score_weights = _parse_score_weights(args.score_weights)
@@ -671,6 +785,10 @@ def main() -> None:
         steps_per_restart=args.steps_per_restart,
         seed=args.seed,
         score_weights=score_weights,
+        ils_perturb_steps=args.ils_perturb_steps,
+        ils_local_steps=args.ils_local_steps,
+        ils_neighborhood_size=args.ils_neighborhood_size,
+        ils_accept_equal=args.ils_accept_equal,
     )
 
 

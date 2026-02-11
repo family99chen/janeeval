@@ -98,6 +98,7 @@ def evaluate_rag(
     return {
         "eval_report": result.get("report"),
         "outputs": result.get("outputs"),
+        "chunking": result.get("chunking"),
     }
 
 
@@ -128,6 +129,7 @@ def evaluate_rag_multimodal(
     return {
         "eval_report": result.get("report"),
         "outputs": result.get("outputs"),
+        "chunking": result.get("chunking"),
     }
 
 # you can use if you want, but may exceed the actual upperbound that config really can access

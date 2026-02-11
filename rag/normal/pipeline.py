@@ -181,8 +181,16 @@ def run_chunking_stage(
             collection_name=collection_name,
             debug_dump=debug_dump,
         )
-    except Exception:
-        return {"client": None, "collection": None, "num_chunks": 0, "debug_dump": None}
+    except Exception as exc:
+        return {
+            "client": None,
+            "collection": None,
+            "collection_name": None,
+            "num_chunks": 0,
+            "debug_dump": None,
+            "error": repr(exc),
+            "error_type": type(exc).__name__,
+        }
 
 
 async def run_chunking_stage_async(
@@ -214,8 +222,16 @@ async def run_chunking_stage_async(
             collection_name=collection_name,
             debug_dump=debug_dump,
         )
-    except Exception:
-        return {"client": None, "collection": None, "num_chunks": 0, "debug_dump": None}
+    except Exception as exc:
+        return {
+            "client": None,
+            "collection": None,
+            "collection_name": None,
+            "num_chunks": 0,
+            "debug_dump": None,
+            "error": repr(exc),
+            "error_type": type(exc).__name__,
+        }
 
 
 def run_rewriter_stage(query: str, selection_path: str) -> str:
@@ -439,6 +455,11 @@ async def run_batch_async(
     collection = result.get("collection")
     client = result.get("client")
     collection_name = result.get("collection_name")
+    chunking = {
+        "num_chunks": result.get("num_chunks", 0),
+        "error": result.get("error"),
+        "error_type": result.get("error_type"),
+    }
 
     config = _load_pipeline_config()
     max_tasks = int(config.get("concurrency", {}).get("max_tasks", 8))
@@ -495,6 +516,7 @@ async def run_batch_async(
             "outputs": outputs_clean,
             "report": report,
             "pipeline_total_time_seconds": batch_elapsed_seconds,
+            "chunking": chunking,
         }
     finally:
         if client is not None and collection_name:

@@ -7,8 +7,8 @@ rag_search_space:
     prompt_template_id: ["1", "2", "3"]
 
   chunking:
-    chunk_size: [256, 512, 1024, 2048]
-    chunk_overlap: [0, 64, 128, 192]
+    chunk_size: [2048]
+    chunk_overlap: [0]
 
   retrieve:
     model_url: ["/home/cz/ragsearch-jane/models/sentence-transformers--all-MiniLM-L6-v2", "/home/cz/ragsearch-jane/models/sentence-transformers--all-MiniLM-L12-v2"]

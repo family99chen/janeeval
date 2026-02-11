@@ -44,48 +44,6 @@ def _dump_yaml(data: Dict[str, Any], path: str) -> None:
         yaml.safe_dump(data, handle, sort_keys=False, allow_unicode=True)
 
 
-def _load_json_or_jsonl(path: str) -> List[Dict[str, Any]]:
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"File not found: {path}")
-    if path.endswith(".jsonl"):
-        items: List[Dict[str, Any]] = []
-        with open(path, "r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                items.append(json.loads(line))
-        return items
-    with open(path, "r", encoding="utf-8") as handle:
-        data = json.load(handle)
-    if not isinstance(data, list):
-        raise ValueError("QA JSON must be a list of objects.")
-    return data
-
-
-def _write_temp_json(items: List[Dict[str, Any]]) -> str:
-    fd, path = tempfile.mkstemp(prefix="sh_qa_", suffix=".json")
-    os.close(fd)
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(items, handle, ensure_ascii=False)
-    return path
-
-
-def _subset_qa_path(
-    qa_items: List[Dict[str, Any]],
-    rng: random.Random,
-    size: int,
-    fallback_path: str,
-) -> Tuple[str, Optional[str]]:
-    total = len(qa_items)
-    if size >= total:
-        return fallback_path, None
-    indices = rng.sample(range(total), size)
-    subset = [qa_items[i] for i in indices]
-    path = _write_temp_json(subset)
-    return path, path
-
-
 def _allowed_values(node: Any) -> List[Any]:
     if node is None:
         return []
@@ -99,9 +57,7 @@ def _allowed_values(node: Any) -> List[Any]:
     return [v for v in allowed if v != "..."]
 
 
-def _split_config(
-    config: Dict[str, Any]
-) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
+def _split_config(config: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any], Optional[Dict[str, Any]]]:
     search_space = config.get("rag_search_space") or {}
     eval_metrics = config.get("eval_metrics")
     algo_cfg = {
@@ -112,23 +68,17 @@ def _split_config(
     return search_space, algo_cfg, eval_metrics
 
 
-def _deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    merged = json.loads(json.dumps(base))
-    for key, value in override.items():
-        if isinstance(value, dict):
-            current = merged.get(key)
-            if not isinstance(current, dict):
-                current = {}
-            merged_child = _deep_update(current, value)
-            if merged_child:
-                merged[key] = merged_child
-            else:
-                merged.pop(key, None)
-            continue
-        if isinstance(value, list):
-            continue
-        merged[key] = value
-    return merged
+def _is_multimodal(search_space: Dict[str, Any], algo_cfg: Dict[str, Any]) -> bool:
+    if isinstance(search_space, dict) and "clip" in search_space:
+        return True
+    return isinstance(algo_cfg, dict) and "clip" in algo_cfg
+
+
+def _set_eval_schema_env(config_path: str, use_multimodal: bool) -> None:
+    if use_multimodal:
+        os.environ["RAGSEARCH_CONFIG_MULTIMODAL"] = config_path
+    else:
+        os.environ["RAGSEARCH_CONFIG"] = config_path
 
 
 def _override_choices(
@@ -220,26 +170,29 @@ def _sanitize_selection(selection: Dict[str, Any]) -> None:
     if isinstance(chunking, dict):
         chunking.pop("model_url", None)
         chunking.pop("model_name", None)
+        if chunking.get("model_url") is None:
+            chunking.pop("model_url", None)
+        if chunking.get("model_name") is None:
+            chunking.pop("model_name", None)
 
 
-def _write_temp_selection(selection: Dict[str, Any]) -> str:
-    fd, path = tempfile.mkstemp(prefix="sh_selection_", suffix=".yaml")
-    os.close(fd)
-    _dump_yaml(selection, path)
-    return path
-
-
-def _is_multimodal(search_space: Dict[str, Any], algo_cfg: Dict[str, Any]) -> bool:
-    if isinstance(search_space, dict) and "clip" in search_space:
-        return True
-    return isinstance(algo_cfg, dict) and "clip" in algo_cfg
-
-
-def _set_eval_schema_env(config_path: str, use_multimodal: bool) -> None:
-    if use_multimodal:
-        os.environ["RAGSEARCH_CONFIG_MULTIMODAL"] = config_path
-    else:
-        os.environ["RAGSEARCH_CONFIG"] = config_path
+def _deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    merged = json.loads(json.dumps(base))
+    for key, value in override.items():
+        if isinstance(value, dict):
+            current = merged.get(key)
+            if not isinstance(current, dict):
+                current = {}
+            merged_child = _deep_update(current, value)
+            if merged_child:
+                merged[key] = merged_child
+            else:
+                merged.pop(key, None)
+            continue
+        if isinstance(value, list):
+            continue
+        merged[key] = value
+    return merged
 
 
 def _module_forced_on(algo_cfg: Dict[str, Any], module: str) -> bool:
@@ -247,6 +200,19 @@ def _module_forced_on(algo_cfg: Dict[str, Any], module: str) -> bool:
         return False
     section = algo_cfg.get(module)
     return isinstance(section, dict) and len(section) > 0
+
+
+def _param_choices(value: Any, override: Optional[List[Any]]) -> List[Any]:
+    if override:
+        return override
+    allowed = _allowed_values(value)
+    if allowed:
+        return allowed
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return []
+    return [value]
 
 
 def _paired_model_choices(
@@ -269,49 +235,32 @@ def _paired_model_choices(
     return list(zip(url_choices, name_choices))
 
 
-def _random_selection(
-    search_space: Dict[str, Any],
+def _seed_module(
+    module: str,
+    params: Dict[str, Any],
     algo_cfg: Dict[str, Any],
-    rng: random.Random,
 ) -> Dict[str, Any]:
-    selection: Dict[str, Any] = {}
-    for module, params in search_space.items():
-        if not isinstance(params, dict):
+    seeded: Dict[str, Any] = {}
+    pair_choices = _paired_model_choices(params, algo_cfg, module)
+    if pair_choices:
+        pair = pair_choices[0]
+        seeded["model_url"] = pair[0]
+        seeded["model_name"] = pair[1]
+    for key, value in params.items():
+        if pair_choices and key in {"model_url", "model_name"}:
             continue
-        is_optional = module in {"rewriter", "reranker", "pruner"}
-        if is_optional and not _module_forced_on(algo_cfg, module) and rng.random() < 0.5:
-            continue
-        selection[module] = {}
-        pair_choices = _paired_model_choices(params, algo_cfg, module)
-        if pair_choices:
-            choice = rng.choice(pair_choices)
-            selection[module]["model_url"] = choice[0]
-            selection[module]["model_name"] = choice[1]
-        for key, value in params.items():
-            if pair_choices and key in {"model_url", "model_name"}:
-                continue
-            choices = _allowed_values(value)
-            override = _override_choices(module, key, algo_cfg)
-            if override:
-                choices = override
-            if choices:
-                selection[module][key] = rng.choice(choices)
-        if not selection[module]:
-            selection.pop(module, None)
-    return selection
+        override = _override_choices(module, key, algo_cfg)
+        choices = _param_choices(value, override)
+        if choices:
+            seeded[key] = choices[0]
+    return seeded
 
 
-def _prepare_selection(
-    selection: Dict[str, Any],
-    algo_cfg: Dict[str, Any],
-    eval_metrics: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    candidate = json.loads(json.dumps(selection))
-    if eval_metrics:
-        candidate["eval_metrics"] = eval_metrics
-    if algo_cfg:
-        candidate = _deep_update(candidate, algo_cfg)
-    return candidate
+def _write_temp_selection(selection: Dict[str, Any]) -> str:
+    fd, path = tempfile.mkstemp(prefix="coord_desc_", suffix=".yaml")
+    os.close(fd)
+    _dump_yaml(selection, path)
+    return path
 
 
 def _evaluate_selection(
@@ -340,7 +289,6 @@ def _evaluate_selection(
         "metric": metric_name,
         "score": score,
         "report": report,
-        "pipeline_total_time_seconds": report.get("pipeline_total_time_seconds"),
         "outputs": result.get("outputs"),
         "chunking": result.get("chunking"),
         "error": result.get("error"),
@@ -348,14 +296,45 @@ def _evaluate_selection(
     }
 
 
-def successive_halving_search(
+def _random_selection(
+    search_space: Dict[str, Any],
+    algo_cfg: Dict[str, Any],
+    rng: random.Random,
+    force_all_on: bool = False,
+) -> Dict[str, Any]:
+    selection: Dict[str, Any] = {}
+    for module, params in search_space.items():
+        if not isinstance(params, dict):
+            continue
+        is_optional = module in {"rewriter", "reranker", "pruner"}
+        if is_optional and not force_all_on and not _module_forced_on(algo_cfg, module):
+            if rng.random() < 0.5:
+                continue
+        selection[module] = {}
+        pair_choices = _paired_model_choices(params, algo_cfg, module)
+        if pair_choices:
+            pair = rng.choice(pair_choices)
+            selection[module]["model_url"] = pair[0]
+            selection[module]["model_name"] = pair[1]
+        for key, value in params.items():
+            if pair_choices and key in {"model_url", "model_name"}:
+                continue
+            override = _override_choices(module, key, algo_cfg)
+            choices = _param_choices(value, override)
+            if choices:
+                selection[module][key] = rng.choice(choices)
+        if not selection[module]:
+            selection.pop(module, None)
+    return selection
+
+
+def coordinate_descent_search(
     qa_json_path: str,
     corpus_json_path: str,
     config_path: str,
     eval_mode: str,
     report_path: str,
-    num_configs: int,
-    eta: int,
+    max_rounds: int,
     seed: int,
     score_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
@@ -369,108 +348,133 @@ def successive_halving_search(
         preferred_metric = algo_cfg.get("score_metric") or algo_cfg.get("metric")
 
     rng = random.Random(seed)
-    eta = max(2, int(eta))
-    num_configs = max(1, int(num_configs))
-    qa_items = _load_json_or_jsonl(qa_json_path)
-    total_items = len(qa_items)
-    if total_items <= 0:
-        raise ValueError("QA JSON is empty.")
-
-    configs: List[Dict[str, Any]] = []
-    attempts = 0
-    max_attempts = max(num_configs * 50, 100)
-    seen: set[str] = set()
-    while len(configs) < num_configs and attempts < max_attempts:
-        attempts += 1
-        selection = _random_selection(search_space, algo_cfg, rng)
-        candidate = _prepare_selection(selection, algo_cfg, eval_metrics)
-        key = json.dumps(candidate, sort_keys=True, ensure_ascii=False)
-        if key in seen:
-            continue
-        seen.add(key)
-        configs.append(candidate)
+    current = _random_selection(search_space, algo_cfg, rng, force_all_on=True)
+    if eval_metrics:
+        current["eval_metrics"] = eval_metrics
+    if algo_cfg:
+        current = _deep_update(current, algo_cfg)
 
     trials: List[Dict[str, Any]] = []
     best_score: float = float("-inf")
     best_config: Dict[str, Any] = {}
+
+    bar = tqdm(desc="coord-desc", unit="trial") if tqdm else None
 
     def _write_report_snapshot() -> None:
         report_dir = os.path.dirname(report_path)
         if report_dir:
             os.makedirs(report_dir, exist_ok=True)
         snapshot = {
-            "best_score": best_score if best_score != float("-inf") else 0.0,
+            "best_score": best_score,
             "best_config": best_config,
             "trials": trials,
         }
         with open(report_path, "w", encoding="utf-8") as handle:
             json.dump(snapshot, handle, ensure_ascii=False, indent=2)
 
-    rounds = 0
-    remaining = num_configs
-    while True:
-        rounds += 1
-        if remaining <= 1:
-            break
-        remaining = max(1, remaining // eta)
-    min_resource = max(1, total_items // (eta ** (rounds - 1)))
-
-    round_idx = 0
-    while len(configs) > 0:
-        round_idx += 1
-        resource = min(total_items, int(min_resource * (eta ** (round_idx - 1))))
-        qa_round_path, cleanup_path = _subset_qa_path(
-            qa_items, rng, resource, qa_json_path
+    def run_trial(stage: str, selection: Dict[str, Any]) -> Tuple[float, Dict[str, Any]]:
+        nonlocal best_score, best_config
+        _sanitize_selection(selection)
+        print(f"\n[coord-desc] trial={stage} selection={json.dumps(selection, ensure_ascii=False)}")
+        score, payload = _evaluate_selection(
+            qa_json_path,
+            corpus_json_path,
+            selection,
+            eval_mode,
+            preferred_metric,
+            score_weights,
+            eval_fn,
         )
-        round_scores: List[Tuple[float, Dict[str, Any], Dict[str, Any]]] = []
-        bar = tqdm(total=len(configs), desc=f"sh-round-{round_idx}", unit="trial") if tqdm else None
-        for idx, candidate in enumerate(configs):
-            print(f"\n[sh] round={round_idx} index={idx+1} selection={json.dumps(candidate, ensure_ascii=False)}")
-            score, payload = _evaluate_selection(
-                qa_round_path,
-                corpus_json_path,
-                candidate,
-                eval_mode,
-                preferred_metric,
-                score_weights,
-                eval_fn,
-            )
-            if payload.get("error"):
-                score = -1.0
-            record = {
-                "round": round_idx,
-                "index": idx + 1,
-                "score": score,
-                "metric": payload.get("metric"),
-                "selection": candidate,
-                "report": payload.get("report"),
-                "pipeline_total_time_seconds": payload.get("pipeline_total_time_seconds"),
-                "outputs": payload.get("outputs"),
-                "chunking": payload.get("chunking"),
-                "error": payload.get("error"),
-                "errors": payload.get("errors"),
-                "resource": resource,
-            }
-            trials.append(record)
-            if score >= best_score:
-                best_score = score
-                best_config = json.loads(json.dumps(candidate))
-            round_scores.append((score, candidate, record))
-            _write_report_snapshot()
-            if bar:
-                bar.update(1)
-        if bar:
-            bar.close()
-        if cleanup_path:
-            os.remove(cleanup_path)
-        if len(configs) <= 1:
+        record = {
+            "stage": stage,
+            "score": payload.get("score"),
+            "metric": payload.get("metric"),
+            "selection": selection,
+            "report": payload.get("report"),
+            "outputs": payload.get("outputs"),
+            "chunking": payload.get("chunking"),
+            "error": payload.get("error"),
+            "errors": payload.get("errors"),
+        }
+        trials.append(record)
+        if score >= best_score:
+            best_score = score
+            best_config = json.loads(json.dumps(selection))
+        _write_report_snapshot()
+        if bar is not None:
+            bar.update(1)
+        return score, record
+
+    current_score, _ = run_trial("init", json.loads(json.dumps(current)))
+
+    module_order = ["rewriter", "chunking", "retrieve", "clip", "reranker", "pruner", "generator"]
+    optional_modules = {"rewriter", "reranker", "pruner"}
+
+    for round_idx in range(1, max_rounds + 1):
+        improved = False
+        for module in module_order:
+            params = search_space.get(module)
+            if not isinstance(params, dict):
+                continue
+            is_optional = module in optional_modules
+            best_candidate = json.loads(json.dumps(current))
+            best_candidate_score = current_score
+
+            if is_optional:
+                off_candidate = json.loads(json.dumps(current))
+                off_candidate.pop(module, None)
+                score_off, _ = run_trial(f"r{round_idx}:{module}:off", off_candidate)
+                if score_off > best_candidate_score:
+                    best_candidate_score = score_off
+                    best_candidate = off_candidate
+
+            base_module = current.get(module)
+            if not isinstance(base_module, dict):
+                base_module = _seed_module(module, params, algo_cfg)
+
+            pair_choices = _paired_model_choices(params, algo_cfg, module)
+            if pair_choices:
+                for pair in pair_choices:
+                    candidate = json.loads(json.dumps(current))
+                    candidate.setdefault(module, json.loads(json.dumps(base_module)))
+                    candidate[module]["model_url"] = pair[0]
+                    candidate[module]["model_name"] = pair[1]
+                    score, _ = run_trial(f"r{round_idx}:{module}.model_pair:{pair}", candidate)
+                    if score > best_candidate_score:
+                        best_candidate_score = score
+                        best_candidate = candidate
+
+            for key, value in params.items():
+                if pair_choices and key in {"model_url", "model_name"}:
+                    continue
+                choices = _allowed_values(value)
+                override = _override_choices(module, key, algo_cfg)
+                if override:
+                    choices = override
+                if not choices:
+                    continue
+                for choice in choices:
+                    candidate = json.loads(json.dumps(current))
+                    candidate.setdefault(module, json.loads(json.dumps(base_module)))
+                    candidate[module][key] = choice
+                    score, _ = run_trial(f"r{round_idx}:{module}.{key}:{choice}", candidate)
+                    if score > best_candidate_score:
+                        best_candidate_score = score
+                        best_candidate = candidate
+
+            if best_candidate_score > current_score:
+                current = best_candidate
+                current_score = best_candidate_score
+                improved = True
+
+        if not improved:
             break
-        round_scores.sort(key=lambda x: x[0], reverse=True)
-        keep = max(1, len(round_scores) // eta)
-        configs = [item[1] for item in round_scores[:keep]]
+
+    if bar is not None:
+        bar.close()
 
     result = {
-        "best_score": best_score if best_score != float("-inf") else 0.0,
+        "best_score": best_score,
         "best_config": best_config,
         "trials": trials,
     }
@@ -483,9 +487,9 @@ def main() -> None:
 
     base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     default_algo_config = os.path.join(os.path.dirname(__file__), "configforalgo.yaml")
-    default_report = os.path.join(base_dir, "outputs", "successive_halving_report.json")
+    default_report = os.path.join(base_dir, "outputs", "coord_desc_report.json")
 
-    parser = argparse.ArgumentParser(description="Successive halving search for RAG.")
+    parser = argparse.ArgumentParser(description="Coordinate descent search for RAG.")
     parser.add_argument("--qa_json", required=True, help="Path to QA JSON/JSONL.")
     parser.add_argument("--corpus_json", required=True, help="Path to corpus JSON.")
     parser.add_argument(
@@ -502,19 +506,13 @@ def main() -> None:
     parser.add_argument(
         "--report_path",
         default=default_report,
-        help="Path to write report JSON.",
+        help="Path to write coord-desc report JSON.",
     )
     parser.add_argument(
-        "--num_configs",
+        "--max_rounds",
         type=int,
-        default=24,
-        help="Number of initial configurations.",
-    )
-    parser.add_argument(
-        "--eta",
-        type=int,
-        default=3,
-        help="Reduction factor.",
+        default=2,
+        help="Max coordinate descent rounds.",
     )
     parser.add_argument(
         "--seed",
@@ -530,14 +528,13 @@ def main() -> None:
     args = parser.parse_args()
 
     score_weights = _parse_score_weights(args.score_weights)
-    successive_halving_search(
+    coordinate_descent_search(
         qa_json_path=args.qa_json,
         corpus_json_path=args.corpus_json,
         config_path=args.config_yaml,
         eval_mode=args.eval_mode,
         report_path=args.report_path,
-        num_configs=args.num_configs,
-        eta=args.eta,
+        max_rounds=args.max_rounds,
         seed=args.seed,
         score_weights=score_weights,
     )

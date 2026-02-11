@@ -98,14 +98,18 @@ def build_chroma_db(
             "collection_name": collection_name,
             "num_chunks": len(ids),
             "debug_dump": debug_dump_data,
+            "error": None,
+            "error_type": None,
         }
-    except Exception:
+    except Exception as exc:
         return {
             "client": None,
             "collection": None,
             "collection_name": None,
             "num_chunks": 0,
             "debug_dump": None,
+            "error": repr(exc),
+            "error_type": type(exc).__name__,
         }
 
 

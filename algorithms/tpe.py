@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import random
 import sys
@@ -247,6 +248,7 @@ def _evaluate_selection(
         "report": report,
         "pipeline_total_time_seconds": report.get("pipeline_total_time_seconds"),
         "outputs": result.get("outputs"),
+        "chunking": result.get("chunking"),
         "error": result.get("error"),
         "errors": result.get("errors"),
     }
@@ -399,16 +401,16 @@ def _sample_choice(rng: random.Random, choices: List[Any], weights: List[float])
     return choices[-1]
 
 
-def _sample_tpe_selection(
+def _build_tpe_counts(
     trials: List[Dict[str, Any]],
     specs: List[Dict[str, Any]],
-    rng: random.Random,
     gamma: float,
-    alpha: float,
-) -> Dict[str, Any]:
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Dict[Any, int]], Dict[str, Dict[Any, int]]]:
     if not trials:
-        return {}
-    sorted_trials = sorted(trials, key=lambda t: t.get("score", float("-inf")), reverse=True)
+        return [], [], {}, {}
+    sorted_trials = sorted(
+        trials, key=lambda t: t.get("score", float("-inf")), reverse=True
+    )
     n_good = max(1, int(len(sorted_trials) * gamma))
     good = sorted_trials[:n_good]
     bad = sorted_trials[n_good:]
@@ -434,6 +436,18 @@ def _sample_tpe_selection(
             bad_counts.setdefault(name, {})
             bad_counts[name][val] = bad_counts[name].get(val, 0) + 1
 
+    return good, bad, good_counts, bad_counts
+
+
+def _sample_values_from_counts(
+    specs: List[Dict[str, Any]],
+    rng: random.Random,
+    good_counts: Dict[str, Dict[Any, int]],
+    bad_counts: Dict[str, Dict[Any, int]],
+    n_good: int,
+    n_bad: int,
+    alpha: float,
+) -> Dict[str, Any]:
     values: Dict[str, Any] = {}
     disabled_modules: set[str] = set()
     for spec in specs:
@@ -445,8 +459,8 @@ def _sample_tpe_selection(
             choices,
             good_counts.get(spec["name"], {}),
             bad_counts.get(spec["name"], {}),
-            len(good),
-            len(bad),
+            n_good,
+            n_bad,
             alpha,
         )
         picked = _sample_choice(rng, choices, weights)
@@ -454,6 +468,60 @@ def _sample_tpe_selection(
         if spec["is_enable"] and picked is False:
             disabled_modules.add(module)
     return values
+
+
+def _surrogate_score_from_counts(
+    values: Dict[str, Any],
+    specs: List[Dict[str, Any]],
+    good_counts: Dict[str, Dict[Any, int]],
+    bad_counts: Dict[str, Dict[Any, int]],
+    n_good: int,
+    n_bad: int,
+    alpha: float,
+) -> float:
+    score = 0.0
+    disabled_modules: set[str] = set()
+    for spec in specs:
+        module = spec["module"]
+        if spec["is_enable"]:
+            enabled = values.get(spec["name"])
+            if enabled is False:
+                disabled_modules.add(module)
+            continue
+        if module in disabled_modules:
+            continue
+        val = values.get(spec["name"])
+        if val is None:
+            continue
+        choices = spec["choices"]
+        p_good = (good_counts.get(spec["name"], {}).get(val, 0) + alpha) / (
+            n_good + alpha * len(choices)
+        )
+        if n_bad > 0:
+            p_bad = (bad_counts.get(spec["name"], {}).get(val, 0) + alpha) / (
+                n_bad + alpha * len(choices)
+            )
+        else:
+            p_bad = 1.0 / len(choices)
+        ratio = p_good / p_bad if p_bad > 0 else p_good
+        if ratio > 0:
+            score += math.log(ratio)
+    return score
+
+
+def _sample_tpe_selection(
+    trials: List[Dict[str, Any]],
+    specs: List[Dict[str, Any]],
+    rng: random.Random,
+    gamma: float,
+    alpha: float,
+) -> Dict[str, Any]:
+    good, bad, good_counts, bad_counts = _build_tpe_counts(trials, specs, gamma)
+    if not good:
+        return {}
+    return _sample_values_from_counts(
+        specs, rng, good_counts, bad_counts, len(good), len(bad), alpha
+    )
 
 
 def _build_selection_from_values(
@@ -495,6 +563,7 @@ def tpe_search(
     startup_trials: int = 10,
     gamma: float = 0.2,
     alpha: float = 1.0,
+    candidate_pool_size: int = 24,
 ) -> Dict[str, Any]:
     config = _load_yaml(config_path)
     search_space, algo_cfg, eval_metrics = _split_config(config)
@@ -535,8 +604,37 @@ def tpe_search(
         if len(trials) < startup_trials:
             candidate = _random_selection(search_space, algo_cfg, rng)
         else:
-            values = _sample_tpe_selection(trials, specs, rng, gamma, alpha)
-            candidate = _build_selection_from_values(values, specs)
+            good, bad, good_counts, bad_counts = _build_tpe_counts(trials, specs, gamma)
+            best_values: Optional[Dict[str, Any]] = None
+            best_surrogate = float("-inf")
+            pool = max(1, int(candidate_pool_size))
+            if good:
+                for _ in range(pool):
+                    values = _sample_values_from_counts(
+                        specs,
+                        rng,
+                        good_counts,
+                        bad_counts,
+                        len(good),
+                        len(bad),
+                        alpha,
+                    )
+                    surrogate = _surrogate_score_from_counts(
+                        values,
+                        specs,
+                        good_counts,
+                        bad_counts,
+                        len(good),
+                        len(bad),
+                        alpha,
+                    )
+                    if surrogate > best_surrogate or best_values is None:
+                        best_surrogate = surrogate
+                        best_values = values
+            if best_values:
+                candidate = _build_selection_from_values(best_values, specs)
+            else:
+                candidate = {}
             if not candidate:
                 candidate = _random_selection(search_space, algo_cfg, rng)
         if eval_metrics:
@@ -567,6 +665,7 @@ def tpe_search(
             "report": payload.get("report"),
             "pipeline_total_time_seconds": payload.get("pipeline_total_time_seconds"),
             "outputs": payload.get("outputs"),
+            "chunking": payload.get("chunking"),
             "error": payload.get("error"),
             "errors": payload.get("errors"),
         }
@@ -647,6 +746,12 @@ def main() -> None:
         help="Smoothing for categorical probabilities.",
     )
     parser.add_argument(
+        "--candidate_pool_size",
+        type=int,
+        default=24,
+        help="Number of TPE candidates to sample before choosing best.",
+    )
+    parser.add_argument(
         "--score_weights",
         default="",
         help="Weighted metrics, e.g. 'bertf11,llmaaj2'.",
@@ -666,6 +771,7 @@ def main() -> None:
         startup_trials=args.startup_trials,
         gamma=args.gamma,
         alpha=args.alpha,
+        candidate_pool_size=args.candidate_pool_size,
     )
 
 
