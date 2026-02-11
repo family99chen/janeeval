@@ -230,16 +230,20 @@ class PolicyNetwork:
     def __init__(self, search_space: Dict[str, Any], algo_cfg: Dict[str, Any]):
         self.params: List[Dict[str, Any]] = []
         self.fixed_params: Dict[str, Dict[str, Any]] = {}
+        self.optional_modules = {"rewriter", "reranker", "pruner"}
         # Each param: { "name": str, "module": str, "key": str, "choices": list, "logits": list[float] }
         
         module_order = ["rewriter", "chunking", "retrieve", "clip", "reranker", "pruner", "generator"]
+        self.forced_modules = {
+            module for module in module_order if _module_forced_on(algo_cfg, module)
+        }
         
         for module in module_order:
             params = search_space.get(module)
             if not isinstance(params, dict):
                 continue
             
-            is_optional = module in {"rewriter", "reranker", "pruner"}
+            is_optional = module in self.optional_modules
             forced_on = _module_forced_on(algo_cfg, module)
             
             # 1. Enable/Disable decision for optional modules
@@ -310,8 +314,17 @@ class PolicyNetwork:
                 trajectory.append({"param_idx": idx, "choice_idx": choice_idx, "logp": logp})
                 if is_enabled:
                     enabled_modules.add(param["module"])
-            elif param["module"] not in ["rewriter", "reranker", "pruner"]:
+            elif param["module"] not in self.optional_modules:
                  enabled_modules.add(param["module"])
+
+        for module in self.fixed_params:
+            if (
+                module in self.optional_modules
+                and module not in enabled_modules
+                and module not in self.forced_modules
+            ):
+                continue
+            enabled_modules.add(module)
 
         # Second pass: Select values for enabled modules
         for module in enabled_modules:
