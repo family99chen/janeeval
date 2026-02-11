@@ -3,7 +3,7 @@ rag_search_space:
   rewriter:
     model_url: ["http://localhost:9000/v1"]
     #model_name: ["gpt-4o-mini"]
-    #api_key: "sk-zk24e7f2482b8475022ced1d684b0370dee6988ab5849313"
+    #api_key: ""
     prompt_template_id: ["1", "2", "3"]
 
   chunking:
@@ -22,18 +22,18 @@ rag_search_space:
   pruner:
     model_url: ["http://localhost:9000/v1"]
     #model_name: ["gpt-4o-mini"]
-    #api_key: "sk-zk24e7f2482b8475022ced1d684b0370dee6988ab5849313"
+    #api_key: ""
     prompt_template_id: ["1", "2", "3"]
 
   generator:
     model_url: ["http://localhost:9000/v1"]
     #model_name: ["gpt-4o-mini"]
-    #api_key: "sk-zk24e7f2482b8475022ced1d684b0370dee6988ab5849313"
+    #api_key: ""
 
 eval_metrics:
   llmaaj:
     model_url: "http://localhost:9000/v1"
     #model_name: "gpt-4o-mini"
-    #api_key: "sk-zk24e7f2482b8475022ced1d684b0370dee6988ab5849313"
+    #api_key: ""
   bert:
     model_url: /home/cz/ragsearch-jane/models/bert-base-uncased
