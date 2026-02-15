@@ -374,6 +374,61 @@ class PolicyNetwork:
     def clone_logits(self) -> List[List[float]]:
         return [list(param["logits"]) for param in self.params]
 
+    def apply_reward_prior(
+        self,
+        sums: List[List[float]],
+        counts: List[List[int]],
+        mix: float,
+        min_count: int,
+        scale: float,
+    ) -> None:
+        if mix <= 0:
+            return
+        for i, param in enumerate(self.params):
+            if i >= len(counts):
+                continue
+            available: List[int] = []
+            means: List[Optional[float]] = [None] * len(param["choices"])
+            for j in range(len(param["choices"])):
+                if j >= len(counts[i]):
+                    continue
+                c = counts[i][j]
+                if c >= min_count:
+                    means[j] = sums[i][j] / c
+                    available.append(j)
+            if len(available) < 2:
+                continue
+            mu = sum(means[j] for j in available if means[j] is not None) / len(available)
+            var = sum((means[j] - mu) ** 2 for j in available if means[j] is not None) / len(
+                available
+            )
+            std = math.sqrt(var) if var > 0 else 0.0
+            if std <= 0:
+                continue
+            for j in available:
+                prior = (means[j] - mu) / std * scale
+                param["logits"][j] = (1.0 - mix) * param["logits"][j] + mix * prior
+
+    def apply_ucb_bonus(
+        self,
+        counts: List[List[int]],
+        coef: float,
+        min_total: int,
+    ) -> None:
+        if coef <= 0:
+            return
+        for i, param in enumerate(self.params):
+            if i >= len(counts):
+                continue
+            total = sum(counts[i])
+            if total < min_total:
+                continue
+            log_term = math.log(total + 1.0)
+            for j in range(len(param["choices"])):
+                c = counts[i][j] if j < len(counts[i]) else 0
+                bonus = coef * math.sqrt(log_term / (c + 1.0))
+                param["logits"][j] += bonus
+
     def update_grpo(
         self,
         trajectories: List[List[Dict[str, Any]]],
@@ -383,11 +438,19 @@ class PolicyNetwork:
         kl_coeff: float,
         clip_ratio: float,
         update_epochs: int,
+        weights: Optional[List[float]] = None,
     ) -> None:
         if not rewards:
             return
-        mean = sum(rewards) / len(rewards)
-        variance = sum((r - mean) ** 2 for r in rewards) / len(rewards)
+        if weights is None or len(weights) != len(rewards):
+            weights = [1.0] * len(rewards)
+        weight_total = sum(weights)
+        if weight_total <= 0:
+            return
+        mean = sum(r * w for r, w in zip(rewards, weights)) / weight_total
+        variance = sum(
+            w * (r - mean) ** 2 for r, w in zip(rewards, weights)
+        ) / weight_total
         std = math.sqrt(variance) if variance > 0 else 0.0
         denom = std if std > 0 else 1.0
         advantages = [(r - mean) / denom for r in rewards]
@@ -396,7 +459,8 @@ class PolicyNetwork:
         clip_ratio = max(0.0, float(clip_ratio))
         for _ in range(epochs):
             logits_updates = [[0.0] * len(p["logits"]) for p in self.params]
-            for traj, adv in zip(trajectories, advantages):
+            for traj, adv, weight in zip(trajectories, advantages, weights):
+                scaled_adv = adv * weight
                 for step in traj:
                     param_idx = step["param_idx"]
                     choice_idx = step["choice_idx"]
@@ -406,14 +470,16 @@ class PolicyNetwork:
                     ref_probs = self.softmax(ref_logits[param_idx])
                     new_logp = math.log(max(probs[choice_idx], 1e-12))
                     ratio = math.exp(new_logp - old_logp)
-                    if adv >= 0:
+                    if scaled_adv >= 0:
                         ratio_used = min(ratio, 1.0 + clip_ratio)
                     else:
                         ratio_used = max(ratio, 1.0 - clip_ratio)
                     for j in range(len(param["logits"])):
                         pg_grad = (1.0 if j == choice_idx else 0.0) - probs[j]
                         kl_grad = probs[j] - ref_probs[j]
-                        logits_updates[param_idx][j] += learning_rate * (ratio_used * adv * pg_grad - kl_coeff * kl_grad)
+                        logits_updates[param_idx][j] += learning_rate * (
+                            ratio_used * scaled_adv * pg_grad - kl_coeff * kl_grad
+                        )
             for i, param in enumerate(self.params):
                 for j in range(len(param["logits"])):
                     param["logits"][j] += logits_updates[i][j]
@@ -479,6 +545,14 @@ def rl_search(
 
     rng = random.Random(seed)
     policy = PolicyNetwork(search_space, algo_cfg)
+    choice_sums: List[List[float]] = [
+        [0.0] * len(param["choices"]) for param in policy.params
+    ]
+    choice_counts: List[List[int]] = [
+        [0] * len(param["choices"]) for param in policy.params
+    ]
+    selection_cache: Dict[str, Dict[str, Any]] = {}
+    elite_buffer: List[Dict[str, Any]] = []
     
     trials: List[Dict[str, Any]] = []
     best_score: float = float("-inf")
@@ -488,6 +562,21 @@ def rl_search(
     
     # Initialize reference logits (fixed reference policy)
     ref_logits = policy.clone_logits()
+    prior_mix = 0.2
+    prior_min_count = 2
+    prior_scale = 1.0
+    ucb_coef = 0.0
+    ucb_min_total = 4
+    elite_size = 0
+    elite_weight = 0.5
+    if isinstance(algo_cfg, dict):
+        prior_mix = float(algo_cfg.get("prior_mix", prior_mix))
+        prior_min_count = int(algo_cfg.get("prior_min_count", prior_min_count))
+        prior_scale = float(algo_cfg.get("prior_scale", prior_scale))
+        ucb_coef = float(algo_cfg.get("ucb_coef", ucb_coef))
+        ucb_min_total = int(algo_cfg.get("ucb_min_total", ucb_min_total))
+        elite_size = int(algo_cfg.get("elite_size", elite_size))
+        elite_weight = float(algo_cfg.get("elite_weight", elite_weight))
 
     def _write_report_snapshot() -> None:
         report_dir = os.path.dirname(report_path)
@@ -504,6 +593,18 @@ def rl_search(
     for ep in range(episodes):
         trajectories: List[List[Dict[str, Any]]] = []
         rewards: List[float] = []
+        policy.apply_reward_prior(
+            sums=choice_sums,
+            counts=choice_counts,
+            mix=prior_mix,
+            min_count=prior_min_count,
+            scale=prior_scale,
+        )
+        policy.apply_ucb_bonus(
+            counts=choice_counts,
+            coef=ucb_coef,
+            min_total=ucb_min_total,
+        )
 
         for idx in range(group_size):
             selection, trajectory = policy.sample(rng)
@@ -516,21 +617,37 @@ def rl_search(
                 f"\n[grpo] episode={ep+1} group={idx+1}/{group_size} selection={json.dumps(selection, ensure_ascii=False)}"
             )
 
-            score, payload = _evaluate_selection(
-                qa_json_path,
-                corpus_json_path,
-                selection,
-                eval_mode,
-                preferred_metric,
-                score_weights,
-                eval_fn,
-            )
+            cache_key = json.dumps(selection, sort_keys=True, ensure_ascii=False)
+            cached = selection_cache.get(cache_key)
+            if cached:
+                score = cached["score"]
+                payload = cached["payload"]
+            else:
+                score, payload = _evaluate_selection(
+                    qa_json_path,
+                    corpus_json_path,
+                    selection,
+                    eval_mode,
+                    preferred_metric,
+                    score_weights,
+                    eval_fn,
+                )
+                selection_cache[cache_key] = {
+                    "score": score,
+                    "payload": payload,
+                }
 
             if payload.get("error"):
                 score = -1.0
 
             trajectories.append(trajectory)
             rewards.append(score)
+            for step in trajectory:
+                param_idx = step["param_idx"]
+                choice_idx = step["choice_idx"]
+                if param_idx < len(choice_sums) and choice_idx < len(choice_sums[param_idx]):
+                    choice_sums[param_idx][choice_idx] += score
+                    choice_counts[param_idx][choice_idx] += 1
 
             record = {
                 "episode": ep + 1,
@@ -553,14 +670,30 @@ def rl_search(
 
             _write_report_snapshot()
 
+        if elite_size > 0:
+            for traj, reward in zip(trajectories, rewards):
+                elite_buffer.append({"reward": reward, "trajectory": traj})
+            elite_buffer.sort(key=lambda item: item["reward"], reverse=True)
+            elite_buffer = elite_buffer[:elite_size]
+
+        combined_trajectories = list(trajectories)
+        combined_rewards = list(rewards)
+        combined_weights = [1.0] * len(rewards)
+        if elite_size > 0 and elite_buffer:
+            for item in elite_buffer:
+                combined_trajectories.append(item["trajectory"])
+                combined_rewards.append(item["reward"])
+                combined_weights.append(elite_weight)
+
         policy.update_grpo(
-            trajectories=trajectories,
-            rewards=rewards,
+            trajectories=combined_trajectories,
+            rewards=combined_rewards,
             ref_logits=ref_logits,
             learning_rate=learning_rate,
             kl_coeff=kl_coeff,
             clip_ratio=clip_ratio,
             update_epochs=update_epochs,
+            weights=combined_weights,
         )
         if bar:
             bar.update(1)
