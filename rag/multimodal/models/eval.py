@@ -200,6 +200,68 @@ def _debug_bert(message: str) -> None:
         print(f"[eval][bert] {message}")
 
 
+def _normalize_metric_names(tokens: List[str]) -> Optional[set[str]]:
+    mapping = {
+        "llmaaj": "LLMAAJ",
+        "bertf1": "BERTScore-F1",
+        "bert": "BERTScore-F1",
+        "bertscore-f1": "BERTScore-F1",
+        "bertscore": "BERTScore-F1",
+        "rougel": "ROUGE-L",
+        "rouge-l": "ROUGE-L",
+        "meteor": "METEOR",
+        "f1": "F1",
+        "bleu": "BLEU",
+        "exactmatch": "ExactMatch",
+        "em": "ExactMatch",
+    }
+    enabled: set[str] = set()
+    for token in tokens:
+        if not token:
+            continue
+        key = token.strip()
+        mapped = mapping.get(key.lower())
+        enabled.add(mapped or key)
+    return enabled or None
+
+
+def _parse_enabled_metrics_from_cfg(
+    eval_cfg: Optional[Dict[str, Any]],
+) -> Optional[set[str]]:
+    if not eval_cfg:
+        return None
+    raw = eval_cfg.get("enabled")
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        tokens = [t for t in re.split(r"[,\s]+", raw.strip()) if t]
+        return _normalize_metric_names(tokens)
+    if isinstance(raw, list):
+        tokens = [str(t) for t in raw if t is not None]
+        return _normalize_metric_names(tokens)
+    return None
+
+
+def _is_metric_enabled(metric_name: str, eval_cfg: Optional[Dict[str, Any]]) -> bool:
+    enabled = _parse_enabled_metrics_from_cfg(eval_cfg)
+    if enabled is None:
+        return True
+    return metric_name in enabled
+
+
+def _is_bert_enabled(eval_cfg: Optional[Dict[str, Any]]) -> bool:
+    if os.getenv("EVAL_DISABLE_BERT") == "1":
+        return False
+    if not eval_cfg:
+        return False
+    bert_cfg = eval_cfg.get("bert")
+    if not isinstance(bert_cfg, dict):
+        return False
+    if bert_cfg.get("enabled") is False:
+        return False
+    return True
+
+
 def _get_llmaaj_prompt() -> str:
     config = _load_pipeline_config().get("llmaaj", {})
     prompt = config.get(
@@ -300,33 +362,40 @@ def evaluate_metrics(
     metrics: Dict[str, Any] = {}
 
     try:
-        exact = [exact_match(p, r) for p, r in zip(preds, refs_list)]
-        metrics["ExactMatch"] = sum(exact) / len(exact) if exact else 0.0
+        if _is_metric_enabled("ExactMatch", eval_cfg):
+            exact = [exact_match(p, r) for p, r in zip(preds, refs_list)]
+            metrics["ExactMatch"] = sum(exact) / len(exact) if exact else 0.0
     except Exception:
         metrics["ExactMatch"] = 0.0
 
     try:
-        f1s = [f1_score(p, r) for p, r in zip(preds, refs_list)]
-        metrics["F1"] = sum(f1s) / len(f1s) if f1s else 0.0
+        if _is_metric_enabled("F1", eval_cfg):
+            f1s = [f1_score(p, r) for p, r in zip(preds, refs_list)]
+            metrics["F1"] = sum(f1s) / len(f1s) if f1s else 0.0
     except Exception:
         metrics["F1"] = 0.0
 
     try:
-        rouges = [rouge_l(p, r) for p, r in zip(preds, refs_list)]
-        metrics["ROUGE-L"] = sum(rouges) / len(rouges) if rouges else 0.0
+        if _is_metric_enabled("ROUGE-L", eval_cfg):
+            rouges = [rouge_l(p, r) for p, r in zip(preds, refs_list)]
+            metrics["ROUGE-L"] = sum(rouges) / len(rouges) if rouges else 0.0
     except Exception:
         metrics["ROUGE-L"] = 0.0
 
     try:
-        bleus = [bleu_score(p, r) for p, r in zip(preds, refs_list)]
-        bleu_vals = [b for b in bleus if b is not None]
-        metrics["BLEU"] = (sum(bleu_vals) / len(bleu_vals)) if bleu_vals else 0.0
+        if _is_metric_enabled("BLEU", eval_cfg):
+            bleus = [bleu_score(p, r) for p, r in zip(preds, refs_list)]
+            bleu_vals = [b for b in bleus if b is not None]
+            metrics["BLEU"] = (sum(bleu_vals) / len(bleu_vals)) if bleu_vals else 0.0
     except Exception:
         metrics["BLEU"] = 0.0
 
     try:
-        bert = bert_f1(preds, refs_list, eval_cfg)
-        metrics["BERTScore-F1"] = 0.0 if bert is None else bert
+        if _is_metric_enabled("BERTScore-F1", eval_cfg) and _is_bert_enabled(eval_cfg):
+            bert = bert_f1(preds, refs_list, eval_cfg)
+            metrics["BERTScore-F1"] = 0.0 if bert is None else bert
+        else:
+            metrics["BERTScore-F1"] = 0.0
     except Exception:
         metrics["BERTScore-F1"] = 0.0
 
@@ -421,17 +490,23 @@ def _compute_per_item(
     pred: str,
     refs: List[str],
     llmaaj_cfg: Optional[Dict[str, Any]],
+    eval_cfg: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
+    enable_exact = _is_metric_enabled("ExactMatch", eval_cfg)
+    enable_f1 = _is_metric_enabled("F1", eval_cfg)
+    enable_rouge = _is_metric_enabled("ROUGE-L", eval_cfg)
+    enable_bleu = _is_metric_enabled("BLEU", eval_cfg)
+    enable_llmaaj = _is_metric_enabled("LLMAAJ", eval_cfg)
     item = {
-        "ExactMatch": exact_match(pred, refs),
-        "F1": f1_score(pred, refs),
-        "ROUGE-L": rouge_l(pred, refs),
-        "BLEU": bleu_score(pred, refs) or 0.0,
+        "ExactMatch": exact_match(pred, refs) if enable_exact else 0.0,
+        "F1": f1_score(pred, refs) if enable_f1 else 0.0,
+        "ROUGE-L": rouge_l(pred, refs) if enable_rouge else 0.0,
+        "BLEU": (bleu_score(pred, refs) or 0.0) if enable_bleu else 0.0,
         "LLMAAJ": 0.0,
         "LLMAAJ_reason": "",
         "LLMAAJ_raw": "",
     }
-    if llmaaj_cfg:
+    if enable_llmaaj and llmaaj_cfg:
         reference_list = [r for r in refs if r]
         if reference_list:
             reference_text = "\n".join(f"- {r}" for r in reference_list)
@@ -476,7 +551,7 @@ def evaluate_report(
             }
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = {
-                    executor.submit(_compute_per_item, q, p, r, llmaaj_cfg): idx
+                    executor.submit(_compute_per_item, q, p, r, llmaaj_cfg, eval_cfg): idx
                     for idx, (q, p, r) in indexed
                 }
                 pending = set(futures.keys())
@@ -528,13 +603,17 @@ def evaluate_report(
             "LLMAAJ_raw": "",
         } for r in results]
 
-        bert_items = bert_f1_per_item(preds, refs_list, eval_cfg)
-        if bert_items is None:
+        if _is_metric_enabled("BERTScore-F1", eval_cfg) and _is_bert_enabled(eval_cfg):
+            bert_items = bert_f1_per_item(preds, refs_list, eval_cfg)
+            if bert_items is None:
+                for item in per_item:
+                    item["BERTScore-F1"] = 0.0
+            else:
+                for item, score in zip(per_item, bert_items):
+                    item["BERTScore-F1"] = score
+        else:
             for item in per_item:
                 item["BERTScore-F1"] = 0.0
-        else:
-            for item, score in zip(per_item, bert_items):
-                item["BERTScore-F1"] = score
         for idx, item in enumerate(per_item):
             item["answer"] = preds[idx] if idx < len(preds) else ""
             item["references"] = refs_list[idx] if idx < len(refs_list) else []

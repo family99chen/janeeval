@@ -596,6 +596,7 @@ async def run_batch_async(
             queries=queries,
             mode=eval_mode,
             eval_cfg=eval_cfg,
+            outputs=outputs_clean,
         )
         batch_elapsed_seconds = time.perf_counter() - batch_t0
         if isinstance(report, dict):
@@ -716,6 +717,7 @@ async def getupperbound_external_async(
             queries=queries,
             mode=eval_mode,
             eval_cfg=eval_cfg,
+            outputs=outputs_clean,
         )
         return {"outputs": outputs_clean, "report": report}
     finally:

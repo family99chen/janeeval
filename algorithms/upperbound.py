@@ -143,6 +143,7 @@ def _parse_score_weights(text: str) -> Optional[Dict[str, float]]:
         "bertf1": "BERTScore-F1",
         "bert": "BERTScore-F1",
         "rougel": "ROUGE-L",
+        "meteor": "METEOR",
         "f1": "F1",
         "bleu": "BLEU",
         "exactmatch": "ExactMatch",
@@ -194,7 +195,7 @@ def _score_from_report(
             return preferred, float(metrics[preferred])
         except Exception:
             return preferred, 0.0
-    for name in ("LLMAAJ", "BERTScore-F1", "ROUGE-L", "F1", "BLEU"):
+    for name in ("LLMAAJ", "BERTScore-F1", "ROUGE-L", "METEOR", "F1", "BLEU"):
         if name in metrics:
             try:
                 return name, float(metrics[name])

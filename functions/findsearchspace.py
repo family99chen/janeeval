@@ -100,6 +100,7 @@ def _build_description(is_multimodal: bool) -> List[str]:
         "Model name and API key are optional and only required when using an API. Change to local mode automatically if api key and model name are not provided.",
         "Prompt templates must be chosen by ID and map to the fixed templates below.",
         "Evaluation resources can be provided under eval_metrics.llmaaj and eval_metrics.bert.",
+        "Use eval_metrics.enabled to control which metrics are computed.",
         "Use the template below to create a selection YAML file.",
     ]
     if is_multimodal:

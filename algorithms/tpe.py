@@ -4,6 +4,7 @@ import os
 import random
 import sys
 import tempfile
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -113,6 +114,7 @@ def _parse_score_weights(text: str) -> Optional[Dict[str, float]]:
         "bertf1": "BERTScore-F1",
         "bert": "BERTScore-F1",
         "rougel": "ROUGE-L",
+        "meteor": "METEOR",
         "f1": "F1",
         "bleu": "BLEU",
         "exactmatch": "ExactMatch",
@@ -164,7 +166,7 @@ def _score_from_report(
             return preferred, float(metrics[preferred])
         except Exception:
             return preferred, 0.0
-    for name in ("LLMAAJ", "BERTScore-F1", "ROUGE-L", "F1", "BLEU"):
+    for name in ("LLMAAJ", "BERTScore-F1", "ROUGE-L", "METEOR", "F1", "BLEU"):
         if name in metrics:
             try:
                 return name, float(metrics[name])
@@ -178,6 +180,27 @@ def _sanitize_selection(selection: Dict[str, Any]) -> None:
     if isinstance(chunking, dict):
         chunking.pop("model_url", None)
         chunking.pop("model_name", None)
+
+
+def _sanitize_selection_for_log(selection: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized = json.loads(json.dumps(selection))
+
+    def _sanitize_node(node: Any) -> None:
+        if isinstance(node, dict):
+            node.pop("api_key", None)
+            node.pop("apikey", None)
+            for value in node.values():
+                _sanitize_node(value)
+        elif isinstance(node, list):
+            for value in node:
+                _sanitize_node(value)
+
+    chunking = sanitized.get("chunking")
+    if isinstance(chunking, dict):
+        chunking.pop("model_url", None)
+        chunking.pop("model_name", None)
+    _sanitize_node(sanitized)
+    return sanitized
 
 
 def _write_temp_selection(selection: Dict[str, Any]) -> str:
@@ -229,7 +252,6 @@ def _evaluate_selection(
     score_weights: Optional[Dict[str, float]],
     eval_fn,
 ) -> Tuple[float, Dict[str, Any]]:
-    _sanitize_selection(selection)
     selection_path = _write_temp_selection(selection)
     try:
         result = eval_fn(
@@ -647,7 +669,13 @@ def tpe_search(
         seen.add(key)
 
         _sanitize_selection(candidate)
-        print(f"\n[tpe] trial={len(trials)+1} selection={json.dumps(candidate, ensure_ascii=False)}")
+        trial_index = len(trials) + 1
+        safe_candidate = _sanitize_selection_for_log(candidate)
+        print(
+            f"\n[tpe] trial={trial_index}/{samples} start selection={json.dumps(safe_candidate, ensure_ascii=False)}",
+            flush=True,
+        )
+        trial_start = time.time()
         score, payload = _evaluate_selection(
             qa_json_path,
             corpus_json_path,
@@ -657,11 +685,18 @@ def tpe_search(
             score_weights,
             eval_fn,
         )
+        trial_elapsed = time.time() - trial_start
+        metric_name = payload.get("metric")
+        metric_score = payload.get("score")
+        print(
+            f"[tpe] trial={trial_index}/{samples} end metric={metric_name} score={metric_score} elapsed_seconds={trial_elapsed:.2f}",
+            flush=True,
+        )
         record = {
             "index": len(trials) + 1,
             "score": payload.get("score"),
             "metric": payload.get("metric"),
-            "selection": candidate,
+            "selection": safe_candidate,
             "report": payload.get("report"),
             "pipeline_total_time_seconds": payload.get("pipeline_total_time_seconds"),
             "outputs": payload.get("outputs"),
@@ -672,7 +707,7 @@ def tpe_search(
         trials.append(record)
         if score >= best_score:
             best_score = score
-            best_config = json.loads(json.dumps(candidate))
+            best_config = json.loads(json.dumps(safe_candidate))
         _write_report_snapshot()
         if bar:
             bar.update(1)
